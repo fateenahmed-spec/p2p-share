@@ -7,6 +7,9 @@ import { chunkFileOffset, chunkLength } from '../lib/offsets.js';
 import { ByteBudget } from '../lib/byte-budget.js';
 import { RequestLedger } from '../lib/request-scheduler.js';
 import { TokenBucket } from '../lib/token-bucket.js';
+import { admitReceiver, MAX_RECEIVERS } from '../lib/receiver-admission.js';
+import { RoundRobinCursor } from '../lib/round-robin.js';
+import { SpeedWindow } from '../lib/speed-window.js';
 
 const status = document.querySelector('#status');
 const fileInput = document.querySelector('#file');
@@ -17,10 +20,12 @@ const peersLabel = document.querySelector('#peers');
 let peer, currentFile, manifest, fileId, metadata, lockStarted = false, lockAcquired = false;
 let unavailableRetries = 0, retryTimer;
 const sessions = new Map(), pendingBulk = new Map();
+const receiverRows = new Map(), frameCursor = new RoundRobinCursor();
 const budget = new ByteBudget();
 const requestStates = new Map();
 let pumping = false, debug = new URL(location.href).searchParams.has('debug');
 let uploadBucket, tokenWakeTimer;
+let drawReceiversPending = false;
 
 function send(control, message) { if (control.open) control.send(encodeControlMessage(message)); }
 function setStatus(message) { status.textContent = message; }
@@ -40,10 +45,62 @@ function publishLink() {
 }
 function renderPeers() {
   document.querySelector('#byte-counts').textContent = String(countedBytes());
-  peersLabel.textContent = [...sessions.values()].map(s => {
-    const active = s.activeSends.size, pending = [...requestStates.values()].filter(r => r.session === s).length;
-    return `${s.peerId}: ${s.bulk?.open ? 'control + bulk paired' : 'waiting for bulk'}; ${active} active sends, ${pending} requested chunks; ${s.requestCount} REQUESTs served; ${countedBytes()} bytes budgeted`;
-  }).join('\n') || 'No receivers connected.';
+  if (!receiverRows.size) { peersLabel.textContent = 'No receivers connected.'; return; }
+  for (const session of sessions.values()) {
+    const row = receiverRows.get(session.peerId); if (!row) continue;
+    const have = session.receiverHave || new Set(), completed = have.size;
+    const percent = metadata?.chunkCount ? completed * 100 / metadata.chunkCount : 0;
+    row.percent.textContent = `${percent.toFixed(1)}% (${completed}/${metadata?.chunkCount || 0} chunks)`;
+    row.speed.textContent = `${(session.speed.bytesPerSecond() / 1024 ** 2).toFixed(2)} MiB/s`;
+    row.paths.textContent = `control ${session.controlPath || 'unknown'}; bulk ${session.bulkPath || 'waiting'}`;
+    row.activity.textContent = `${session.bulk?.open ? 'paired' : 'waiting for bulk'}; ${session.activeSends.size} active sends; ${session.requestCount} REQUESTs served`;
+    row.error.textContent = session.error || '';
+    row.root.classList.remove('disconnected');
+  }
+  queueReceiverDraw();
+}
+function ensureReceiverRow(peerId) {
+  let row = receiverRows.get(peerId); if (row) return row;
+  const root = document.createElement('article'); root.className = 'receiver-row';
+  const title = document.createElement('h3'), id = document.createElement('code'), meta = document.createElement('div'); meta.className = 'receiver-meta';
+  const percent = document.createElement('output'), speed = document.createElement('output'), paths = document.createElement('span'), activity = document.createElement('span'), error = document.createElement('span'); error.className = 'receiver-error';
+  const canvas = document.createElement('canvas'); canvas.className = 'receiver-grid'; canvas.width = 1000; canvas.height = 12;
+  title.textContent = 'Receiver '; id.textContent = peerId; title.append(id);
+  for (const el of [percent, speed, paths, activity]) meta.append(el);
+  root.append(title, meta, canvas, error); if (!receiverRows.size) peersLabel.replaceChildren(); peersLabel.append(root);
+  row = { root, canvas, context: canvas.getContext('2d'), percent, speed, paths, activity, error };
+  receiverRows.set(peerId, row); return row;
+}
+function queueReceiverDraw() {
+  if (drawReceiversPending) return; drawReceiversPending = true;
+  requestAnimationFrame(() => { drawReceiversPending = false; for (const session of sessions.values()) drawReceiverGrid(session); });
+}
+function drawReceiverGrid(session) {
+  const row = receiverRows.get(session.peerId), count = metadata?.chunkCount || 0; if (!row || !count) return;
+  const cells = Math.min(count, row.canvas.width), have = session.receiverHave || new Set(), width = row.canvas.width / cells;
+  row.context.clearRect(0, 0, row.canvas.width, row.canvas.height);
+  for (let cell = 0; cell < cells; cell++) {
+    const from = Math.floor(cell * count / cells), to = Math.max(from + 1, Math.floor((cell + 1) * count / cells));
+    let verified = 0; for (let index = from; index < to; index++) if (have.has(index)) verified++;
+    row.context.fillStyle = verified === to - from ? '#218739' : verified ? '#6eaa7a' : '#c7cbd1';
+    row.context.fillRect(cell * width, 0, Math.max(1, width - .5), row.canvas.height);
+  }
+}
+function updatePath(session, kind, connection) {
+  const pc = connection?.peerConnection; if (!pc) return;
+  const assign = async () => {
+    try {
+      const stats = await pc.getStats(); let pair;
+      for (const stat of stats.values()) {
+        if (stat.type === 'candidate-pair' && (stat.selected || stat.nominated && stat.state === 'succeeded')) { pair = stat; break; }
+        if (stat.type === 'transport' && stat.selectedCandidatePairId) pair = stats.get(stat.selectedCandidatePairId);
+      }
+      if (!pair) return;
+      const local = stats.get(pair.localCandidateId), remote = stats.get(pair.remoteCandidateId);
+      session[`${kind}Path`] = local?.candidateType === 'relay' || remote?.candidateType === 'relay' ? 'relayed' : 'direct'; renderPeers();
+    } catch { /* diagnostic only */ }
+  };
+  pc.addEventListener('iceconnectionstatechange', assign); pc.addEventListener('connectionstatechange', assign); void assign();
 }
 function countedBytes() { const m = bufferedMetrics(); return budget.countedBytes(m.global); }
 function bufferedMetrics() {
@@ -88,7 +145,7 @@ function startPeer() {
 function acceptControl(control) {
   if (control.metadata?.kind !== 'control' || sessions.has(control.peer)) { control.close(); return; }
   let session, timer;
-  control.on('open', () => { timer = setTimeout(() => { if (!session?.bulk) { control.close(); session?.bulk?.close(); } }, 10000); startPings(control, ms => document.querySelector('#rtt').textContent = `${ms} ms`); });
+  control.on('open', () => { timer = setTimeout(() => { if (!session?.bulk) { control.close(); session?.bulk?.close(); } }, 10000); startPings(control, ms => document.querySelector('#rtt').textContent = `${ms} ms`); if (session) updatePath(session, 'control', control); });
   control.on('data', raw => {
     let message;
     try { message = parseControlMessage(raw); } catch { control.close(); return; }
@@ -96,8 +153,11 @@ function acceptControl(control) {
       if (message.type !== 'HELLO' || message.role !== 'receiver' || message.protocolVersion !== 1) {
         control.send(encodeControlMessage({ type: 'ERROR', code: 'PROTOCOL', message: 'Expected receiver HELLO for protocol version 1.' })); control.close(); return;
       }
-      session = { control, peerId: control.peer, sessionId: random.hex128(), bulk: null, manifestSent: false, activeSends: new Map(), ledger: new RequestLedger(), requestCount: 0 };
+      if (!admitReceiver(sessions.size, { sendError: message => control.send(encodeControlMessage(message)), close: () => control.close() })) return;
+      ensureReceiverRow(control.peer);
+      session = { control, peerId: control.peer, sessionId: random.hex128(), bulk: null, manifestSent: false, activeSends: new Map(), ledger: new RequestLedger(), requestCount: 0, speed: new SpeedWindow(), controlPath: 'unknown', bulkPath: 'waiting' };
       sessions.set(control.peer, session);
+      updatePath(session, 'control', control);
       send(control, { type: 'HELLO', role: 'sender', protocolVersion: 1, sessionId: session.sessionId });
       const waiting = pendingBulk.get(control.peer);
       if (waiting) { pendingBulk.delete(control.peer); pairBulk(session, waiting); }
@@ -109,21 +169,15 @@ function acceptControl(control) {
       if (!metadata || message.hex.length !== expectedBytes * 2) { control.close(); return; }
       const remainder = metadata.chunkCount % 8;
       if (remainder && Number.parseInt(message.hex.slice(-2), 16) % (2 ** (8 - remainder)) !== 0) { control.close(); return; }
-      let verified = 0;
-      for (let i = 0; i < metadata.chunkCount; i++) {
-        const byte = Number.parseInt(message.hex.slice(Math.floor(i / 8) * 2, Math.floor(i / 8) * 2 + 2), 16);
-        if (Math.floor(byte / (2 ** (i % 8))) % 2 === 1) verified++;
-      }
       session.receiverHave = new Set();
       for (let i = 0; i < metadata.chunkCount; i++) {
         const byte = Number.parseInt(message.hex.slice(Math.floor(i / 8) * 2, Math.floor(i / 8) * 2 + 2), 16);
         if (Math.floor(byte / (2 ** (i % 8))) % 2 === 1) session.receiverHave.add(i);
       }
-      const percent = metadata.chunkCount ? verified * 100 / metadata.chunkCount : 0;
-      peersLabel.textContent = `${session.peerId}: control + bulk paired; BITFIELD ${message.hex.length / 2} bytes; ${verified}/${metadata.chunkCount} chunks verified (${percent.toFixed(1)}%); ${session.activeSends.size} active; ${countedBytes()} bytes budgeted`;
+      renderPeers();
       return;
     }
-    if (message.type === 'HAVE') { message.indices.forEach(i => session.receiverHave?.add(i)); return; }
+    if (message.type === 'HAVE') { message.indices.forEach(i => session.receiverHave?.add(i)); renderPeers(); return; }
     if (message.type === 'REJECT') { cancelRequest(session, message.index, message.attempt); return; }
     if (message.type === 'REQUEST') { session.requestCount++; onRequest(session, message); renderPeers(); return; }
     if (message.type === 'CANCEL') { cancelRequest(session, message.index, message.attempt); return; }
@@ -131,7 +185,7 @@ function acceptControl(control) {
     control.close();
   });
   control.on('close', () => { clearTimeout(timer); if (session) disconnectSession(session); });
-  control.on('error', e => setStatus(safeError(e)));
+  control.on('error', e => { if (session) session.error = safeError(e); setStatus(safeError(e)); renderPeers(); });
 }
 function acceptBulk(bulk) {
   const sessionId = bulk.metadata?.sessionId;
@@ -146,9 +200,10 @@ function acceptBulk(bulk) {
 function pairBulk(session, bulk) {
   if (bulk.peer !== session.peerId || bulk.metadata?.sessionId !== session.sessionId || session.bulk) { bulk.close(); return; }
   session.bulk = bulk; clearTimeout(bulk.__pairTimer);
+  updatePath(session, 'bulk', bulk);
   bulk.on('data', () => { session.control.close(); bulk.close(); });
-  bulk.on('open', () => { configureBackpressure(session); renderPeers(); sendManifest(session); pumpTransfers(); });
-  bulk.on('close', renderPeers); bulk.on('error', e => setStatus(safeError(e)));
+  bulk.on('open', () => { updatePath(session, 'bulk', bulk); configureBackpressure(session); renderPeers(); sendManifest(session); pumpTransfers(); });
+  bulk.on('close', renderPeers); bulk.on('error', e => { session.error = safeError(e); setStatus(safeError(e)); renderPeers(); });
   if (bulk.open) { configureBackpressure(session); renderPeers(); sendManifest(session); pumpTransfers(); }
 }
 function configureBackpressure(session) {
@@ -199,7 +254,9 @@ function cancelRequest(session, index, attempt) {
 }
 function disconnectSession(session) {
   for (const [key, state] of requestStates) if (state.session === session) requestStates.delete(key);
-  budget.disconnect(session.peerId); sessions.delete(session.peerId); session.bulk?.close(); renderPeers(); pumpTransfers();
+  budget.disconnect(session.peerId); session.activeSends.clear(); sessions.delete(session.peerId); session.error ||= 'Disconnected';
+  const row = receiverRows.get(session.peerId); if (row) { row.root.classList.add('disconnected'); row.activity.textContent = 'Disconnected; reservations released.'; }
+  session.bulk?.close(); renderPeers(); pumpTransfers();
 }
 function pumpTransfers() {
   if (pumping || !currentFile || !metadata) return;
@@ -233,8 +290,10 @@ async function readRequestedChunk(state) {
 function pumpFrames() {
   let progressed;
   do {
-    progressed = false;
-    for (const session of sessions.values()) {
+    progressed = false; let tokenBlocked = false;
+    const candidates = [...sessions.values()];
+    for (let visit = 0; visit < candidates.length; visit++) {
+      const session = frameCursor.next(candidates, value => value.peerId);
       const channel = session.bulk?.dataChannel;
       if (!channel || channel.readyState !== 'open' || channel.bufferedAmount > 1024 * 1024) continue;
       for (const state of session.activeSends.values()) {
@@ -242,12 +301,18 @@ function pumpFrames() {
         const metrics = bufferedMetrics();
         if (!budget.canQueue(session.peerId, FRAME_HEADER_BYTES + MAX_FRAME_PAYLOAD_BYTES, { bufferedGlobal: metrics.global, bufferedByPeer: metrics.byPeer })) continue;
         const frameSize = nextFrameSize(state);
-        if (uploadBucket && !uploadBucket.take(frameSize)) { scheduleTokenWake(uploadBucket.delayFor(frameSize)); continue; }
+        if (uploadBucket && !uploadBucket.take(frameSize)) { scheduleTokenWake(uploadBucket.delayFor(frameSize)); tokenBlocked = true; break; }
+        const payloadBytes = state.stage === 'data' ? Math.min(MAX_FRAME_PAYLOAD_BYTES, state.length - state.offset) : 0;
         const next = nextFrame(state);
         if (!next) continue;
         try { channel.send(next); }
         catch (error) { if (debug) console.debug('Direct PeerJS dataChannel.send failed', safeError(error)); session.control.close(); break; }
         progressed = true;
+        if (payloadBytes) {
+          session.speed.add(payloadBytes);
+          const row = receiverRows.get(session.peerId);
+          if (row) row.speed.textContent = `${(session.speed.bytesPerSecond() / 1024 ** 2).toFixed(2)} MiB/s`;
+        }
         if (channel.bufferedAmount > 8 * 1024 * 1024 && debug) console.debug('PeerJS 8 MiB queue threshold crossed on direct dataChannel.send', channel.bufferedAmount);
         if (state.stage === 'done') {
           session.activeSends.delete(state.key); requestStates.delete(state.key); budget.release(state.key);
@@ -255,8 +320,9 @@ function pumpFrames() {
         }
         break;
       }
+      if (progressed || tokenBlocked) break;
     }
-  } while (progressed);
+  } while (progressed && !tokenBlocked);
 }
 function nextFrameSize(state) {
   if (state.stage === 'start') return FRAME_HEADER_BYTES + 4;
@@ -314,7 +380,7 @@ document.querySelector('#upload-limit').addEventListener('change', event => {
   const kib = Number(event.currentTarget.value);
   if (!Number.isFinite(kib) || kib < 0 || kib > 102400) { event.currentTarget.value = '0'; uploadBucket = undefined; return; }
   clearTimeout(tokenWakeTimer); tokenWakeTimer = undefined;
-  uploadBucket = kib === 0 ? undefined : new TokenBucket({ rateBytesPerSecond: kib * 1024, burstBytes: Math.max(16394, Math.ceil(kib * 1024)) });
+  uploadBucket = kib === 0 ? undefined : new TokenBucket({ rateBytesPerSecond: kib * 1024, burstBytes: Math.max(2 * (FRAME_HEADER_BYTES + MAX_FRAME_PAYLOAD_BYTES), Math.ceil(kib * 1024 / 10)) });
   pumpFrames();
 });
 setupSettings(startPeer);

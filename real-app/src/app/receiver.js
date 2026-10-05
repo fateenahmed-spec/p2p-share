@@ -8,7 +8,7 @@ import { decodeFrame, FrameReassembler } from '../lib/frames.js';
 import { encodeBitfield, decodeBitfield, HolderSet } from '../lib/bitfield.js';
 import { RequestScheduler } from '../lib/request-scheduler.js';
 import { OPFS_WRITE_QUEUE_LIMIT } from '../lib/byte-queue.js';
-import { checkAvailableStorage } from '../lib/storage-preflight.js';
+import { checkAvailableStorage as runStoragePreflight } from '../lib/storage-preflight.js';
 import { clearWithFileLock } from '../lib/receiver-lock.js';
 import { createDebugLogRing } from '../lib/debug-log.js';
 
@@ -330,7 +330,7 @@ async function initializeStorageAfterManifest(parsed) {
 }
 
 async function checkAvailableStorage(size) {
-  const result = await checkAvailableStorage(size, {
+  const result = await runStoragePreflight(size, {
     estimate: () => {
       if (typeof navigator.storage.estimate !== 'function') throw new Error('Storage estimate API unavailable');
       return navigator.storage.estimate();
