@@ -1,25 +1,81 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-43QWdXRYqoruk3xgeG1fkfclU77XwuXByfeHGbc8oj0='; worker-src 'self'; connect-src 'self' https://0.peerjs.com wss://0.peerjs.com http://localhost:9000 ws://localhost:9000 http://localhost:9001 ws://localhost:9001 http://127.0.0.1:9001 ws://127.0.0.1:9001">
+  <link rel="stylesheet" href="./styles.css">
   <title>P2P Share — Receiver</title>
   <script type="importmap">{"imports":{"peerjs-js-binarypack":"./vendor/peerjs/deps/binarypack/binarypack.mjs","webrtc-adapter":"./vendor/peerjs/deps/adapter.mjs","@msgpack/msgpack":"./vendor/peerjs/deps/msgpack/index.mjs"}}</script>
 </head>
-<body>
-  <main><h1>Receive a file</h1><p id="feature-status" role="status"></p><p id="status" role="status">Checking link…</p><p>Room: <code id="room"></code></p>
-    <dl><dt>Name</dt><dd id="file-name"></dd><dt>Size</dt><dd id="file-size"></dd></dl><p>Control RTT: <output id="rtt">—</output></p>
-    <p id="transfer-progress">Waiting for manifest.</p><p id="transfer-stats"></p>
-    <canvas id="chunk-grid" width="900" height="12" role="img" aria-label="Chunk transfer status grid"></canvas>
-    <section id="saved-file-actions" aria-label="Saved file actions">
-      <button id="download-file" type="button" disabled>Download</button>
-      <button id="save-as" type="button" hidden>Save As…</button>
-      <button id="verify-file" type="button" disabled>Verify whole file</button>
-      <button id="cancel-verify" type="button" hidden>Cancel verification</button>
-      <button id="offset-probe" type="button" hidden>Run DEBUG OPFS offset probe</button>
-      <button id="clear-saved-data" type="button" hidden>Clear saved data</button>
-      <p id="verify-status" role="status"></p>
+<body class="app-page receiver-page">
+  <header class="topbar">
+    <a class="brand" href="./sender.html" aria-label="P2P Share home">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="9" fill="currentColor"/><path d="M9 16h12m-5-5 5 5-5 5" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>P2P Share</span>
+    </a>
+    <p id="status" class="status-pill" role="status">Checking link…</p>
+  </header>
+
+  <main class="page-content receiver-content">
+    <div class="page-heading receiver-heading">
+      <div><p class="eyebrow">PRIVATE FILE TRANSFER</p><h1>Receive a file</h1><p class="lede">Connect directly to the sender and save a verified copy to this device.</p></div>
+    </div>
+
+    <p id="feature-status" class="info-banner" role="status"></p>
+
+    <section class="card file-card" aria-labelledby="file-name">
+      <p class="eyebrow">FILE DETAILS</p>
+      <h2 id="file-name" class="file-name">Waiting for file details</h2>
+      <div class="metadata-row">
+        <span class="metadata-item"><span class="metadata-label">Size</span><strong id="file-size">—</strong></span>
+        <span class="metadata-item"><span class="metadata-label">Room ID</span><code id="room" class="mono selectable" title="Select to copy the room ID"></code></span>
+        <span class="metadata-item"><span class="metadata-label">Control RTT</span><strong><output id="rtt">—</output></strong></span>
+      </div>
+      <p id="transfer-stats" class="storage-note"></p>
     </section>
-    <details><summary>ICE settings</summary><form id="ice-settings"><label>ICE URLs, one per line <textarea id="ice-urls" autocomplete="off"></textarea></label><label>Username <input id="ice-username" autocomplete="off"></label><label>Credential <input id="ice-credential" type="password" autocomplete="new-password"></label><label><input id="force-relay" type="checkbox"> Force relay</label><button>Apply &amp; reconnect</button><button type="button" id="clear-settings">Clear</button></form></details>
-  </main><script type="module" src="./src/app/receiver.js"></script>
-</body></html>
+
+    <section class="card progress-card" aria-labelledby="progress-title">
+      <div class="card-heading"><div><p class="eyebrow">TRANSFER PROGRESS</p><h2 id="progress-title">Saved chunks</h2></div></div>
+      <p id="transfer-progress" class="progress-copy">Waiting for manifest.</p>
+      <p class="progress-hint">Chunk colors show live transfer and verification state.</p>
+    </section>
+
+    <section class="card grid-card" aria-labelledby="grid-title">
+      <div class="card-heading"><div><p class="eyebrow">LIVE STATUS</p><h2 id="grid-title">Chunk map</h2></div></div>
+      <div class="chunk-legend" aria-label="Chunk status legend">
+        <span><i class="legend-swatch missing" aria-hidden="true"></i>Missing</span>
+        <span><i class="legend-swatch arriving" aria-hidden="true"></i>Arriving</span>
+        <span><i class="legend-swatch verified" aria-hidden="true"></i>Verified</span>
+        <span><i class="legend-swatch failed" aria-hidden="true"></i>Failed</span>
+      </div>
+      <canvas id="chunk-grid" width="900" height="12" role="img" aria-label="Chunk transfer status grid: gray is missing, blue is arriving, green is verified, and red is a failed hash check"></canvas>
+    </section>
+
+    <section id="saved-file-actions" class="action-card" aria-label="Saved file actions">
+      <div class="action-copy"><p class="eyebrow">WHEN READY</p><p>Save the completed file or verify its chunks again.</p></div>
+      <div class="action-buttons">
+        <button id="download-file" class="button button-primary" type="button" disabled>Download</button>
+        <button id="save-as" class="button button-secondary" type="button" hidden>Save As…</button>
+        <button id="verify-file" class="button button-secondary" type="button" disabled>Verify whole file</button>
+        <button id="cancel-verify" class="button button-secondary" type="button" hidden>Cancel verification</button>
+        <button id="offset-probe" class="button button-secondary" type="button" hidden>Run DEBUG OPFS offset probe</button>
+        <button id="clear-saved-data" class="button button-danger" type="button" hidden>Clear saved data</button>
+      </div>
+      <p id="verify-status" class="verify-status" role="status"></p>
+    </section>
+
+    <details class="card settings-card receiver-settings">
+      <summary><span><span class="eyebrow">CONFIGURATION</span><strong>ICE / TURN settings</strong></span><span class="summary-hint">Optional connection routing</span></summary>
+      <div class="details-content"><form id="ice-settings" class="settings-form">
+        <label for="ice-urls">ICE URLs, one per line<textarea id="ice-urls" autocomplete="off" rows="3"></textarea></label>
+        <div class="form-grid"><label for="ice-username">Username<input id="ice-username" autocomplete="off"></label><label for="ice-credential">Credential<input id="ice-credential" type="password" autocomplete="new-password"></label></div>
+        <label class="check-field" for="force-relay"><input id="force-relay" type="checkbox"> Force relay</label>
+        <div class="button-row"><button class="button button-primary" type="submit">Apply &amp; reconnect</button><button class="button button-secondary" type="button" id="clear-settings">Clear</button></div>
+      </form></div>
+    </details>
+  </main>
+  <footer class="page-footer">Transfers are verified against the sender’s file ID before saved chunks are accepted.</footer>
+  <script type="module" src="./src/app/receiver.js"></script>
+</body>
+</html>
