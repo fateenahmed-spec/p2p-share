@@ -8,7 +8,7 @@ self.onmessage = async ({ data }) => {
           !(buffer instanceof ArrayBuffer) || typeof expectedHash !== 'string' || !/^[a-f0-9]{64}$/.test(expectedHash)) throw new Error('Invalid chunk verification request.');
       const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', buffer));
       const actual = Array.from(digest, b => b.toString(16).padStart(2, '0')).join('');
-      if (actual !== expectedHash) { self.postMessage({ type: 'CHUNK_HASH_MISMATCH', index, attempt }); return; }
+      if (actual !== expectedHash) { self.postMessage({ type: 'CHUNK_HASH_MISMATCH', index, attempt, actual, expectedHash }); return; }
       self.postMessage({ type: 'CHUNK_HASH_OK', index, attempt, buffer }, [buffer]);
       return;
     }

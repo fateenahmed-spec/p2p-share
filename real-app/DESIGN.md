@@ -1,6 +1,6 @@
 # P2P Share — Sub-step 0 Design
 
-**Status:** Sub-steps 0–2 approved; Sub-step 3 in progress. Stop after S3 for review.
+**Status:** Sub-steps 0–3 approved; Sub-step 4 implementation complete, pending review. No S5.
 
 This document folds in Parts 1–4 and all follow-up answers. Part 1–3 decisions and approved answers are binding. Remaining implementation-specific choices are recorded as proposals.
 
@@ -220,10 +220,12 @@ Every row is an acceptance case; tests must not be weakened or deleted to pass.
 | Situation | Required behavior | Test method |
 |---|---|---|
 | Sender leaves/refreshes | Clear message; fast retries at 1/3/9 s, then Retry; same fileId resumes; new fileId shows different-file error. | Refresh sender mid-transfer; re-pick same file. |
-| Receiver leaves | Others unaffected; sender releases its sends, buffers, byte reservations. | Close 1 of 3 receivers; sender counters return to baseline. |
+| Receiver leaves | Other receivers continue; sender frees that receiver's active sends, buffers, and byte reservations; its row remains grey with zero counters. | Close 1 of 3 receivers around 50%; verify the other two complete and the disconnected row reports zero active sends/reservations. |
 | Receiver stalls/unresponsive | STALLED at 30 s or UNRESPONSIVE after 15 s without PONG; after 60 s treated as left, resources freed; others unaffected. | Pause receiver JS with DevTools/CDP. |
 | Global cap exhausted | Other receivers wait without retry storm, progress after release; count never exceeds 64 MiB. | Pause 4 receivers and keep 6 healthy; inspect counters. |
-| Disk full / QuotaExceededError | Stop, tell user; default proposal frees memory/handles but retains verified OPFS data/progress and offers Clear saved data. | CDP `Storage.overrideQuotaForOrigin` or small quota. |
+| Disk full / QuotaExceededError | Stop before REQUEST when estimated available bytes are below required; retain saved data and offer Clear saved data. If estimate fails, warn and proceed. | Production preflight Node test injects 64 MiB and 2 GiB available for a 500 MiB file and estimate rejection. CDP is blocked: `Protocol error (Storage.overrideQuotaForOrigin): Internal error`. |
+| Three receiver upload fairness | Shared token bucket stays within aggregate cap and round-robin frames prevent one consumer monopolizing; byte-budget grants keep rotating. | Injected-clock Node tests with 3 consumers and byte-budget fairness; browser aggregate cap measurement pending. |
+| OPFS offset probe above 4 GiB | Include actual partial-write count, offset, bytes remaining, handle size, and size after truncate in DEBUG diagnostics. Chrome 154 returned count 4,294,967,288 at offset 4,500,000,000, remaining 8, and file size 0 after truncate; a 4,000,000,000-byte target also failed. Does not establish a 4 GiB boundary. | `node scripts/s3-offset-probe.mjs`; HeadlessChrome 154.0.0.0, estimate 10 GiB quota and zero usage. |
 | Repeated hash failure | Three failures produce visible chunk-number error; keep other verified chunks. | DEBUG deterministic corruption of chunk N. |
 | Occasional corruption | Retry succeeds; counters visible. Corrupt ~1% of CHUNK ATTEMPTS, never 1% of frames. | DEBUG probabilistic attempt corruption. |
 | Duplicate receiver tab, same room | Lock reports “already open”; fileId OPFS entries untouched. | Open same link twice in one profile. |
@@ -233,7 +235,7 @@ Every row is an acceptance case; tests must not be weakened or deleted to pass.
 | Malformed frame/control | Drop/count; disconnect after violation threshold. | Fuzz harness and DEBUG live injection. |
 | Sleep/hidden/discard | Wake lock while active; recover with reconnect/resume; document limits and hidden-tab timer clamp. | Lock screen, hide ≥2 min, Chrome Memory Saver discard. |
 | TURN unavailable/forced relay | Show path per connection; work if relay reachable, clear error otherwise. | Local coturn forced relay with valid/invalid credentials; public TURN smoke only. |
-| Late joiner/room full | Correct state; excess gets ROOM_FULL. | `maxReceivers=2`, open third receiver. |
+| Late joiner/room full | First 10 receivers are admitted; the 11th gets ERROR ROOM_FULL and closes. | Node admission test at the 10-receiver boundary; browser/manual three-receiver acceptance. |
 | Completed receiver reopens | All-ones BITFIELD accepted, sender shows 100%, no REQUESTs. | Finish; reload receiver. |
 | Stale/wrong link | “File info doesn’t match the link”; fileId OPFS entries untouched. | Edit `fid`. |
 | Worker crash/OPFS error/storage cleared | Visible stop/error; preserve progress where possible. | DEBUG kill worker; clear site data mid-transfer. |
@@ -364,12 +366,25 @@ Method for final transfer results: total time is first REQUEST to last chunk ver
 
 | Test | File size | Receivers | Sender cap | Path | Total time | Aggregate throughput | Sender upload share | Runs |
 |---|---:|---:|---:|---|---:|---:|---:|---:|
-| Single download | Not measured | 1 | Not measured | Not measured | Not measured | Not measured | Not measured | 0 |
+| S2 | 32 MiB | 1 | Unlimited | Not measured | 23,786 ms | 1.35 MiB/s | Not measured | 1 |
+| S3 | 32 MiB | 1 | Unlimited | Not measured | 11,310 ms | 2.83 MiB/s | Not measured | 1 |
+| S3 | 500 MiB | 1 | Unlimited | Not measured | 191,640 ms | 2.61 MiB/s | Not measured | 1 |
+| S4 isolation | 500 MiB | 1 | Unlimited | Not measured | Not recorded | 4.54 MiB/s | Not measured | 1 |
+| S4 isolation | 500 MiB | 1 | 10 MiB/s | Not measured | Not recorded | 4.58 MiB/s | Not measured | 1 |
+| S4 isolation | 500 MiB each | 2 | Unlimited | Not measured | Not recorded | 3.60 MiB/s aggregate | Not measured | 1 |
+| S4 concurrent | 500 MiB each | 3 | 10 MiB/s | Not measured | Not recorded | 1.90 MiB/s aggregate | Not measured | 1 |
+| S4 close-one | 500 MiB each | 3, then 2 | 10 MiB/s | Not measured | Not recorded | 1.93 MiB/s aggregate during close run | Not measured | 1 |
 | Stage 1 star | Not measured | 3 | Not measured | Not measured | Not measured | Not measured | Not measured | 0 |
 | S0 browser capability probe | 4-byte payload | 2 pages | n/a | local host candidate | Passed headless + headed; duration not retained | Not measured | n/a | 1 each |
 
-S2 acceptance note (one run, not a three-run median): 32 MiB transferred in 23,786 ms after the first REQUEST, 1.35 MiB/s, 8/8 request slots observed, Chrome 154.0.8037.97, same-host local PeerServer, measured control RTT 360 ms. A one-cycle receiver change that sent PONG directly on the control RTCDataChannel measured 325 ms RTT and 1.30 MiB/s; this did not resolve the unexpectedly high RTT and was reverted. Measurement quirk to revisit after S4: hypothesis is that PONG handling is delayed by bulk-frame processing on the receiver main thread.
+S2 acceptance note (one run, not a three-run median): 32 MiB transferred in 23,786 ms after the first REQUEST, 1.35 MiB/s, 8/8 request slots observed, Chrome 154.0.8037.97, same-host local PeerServer, measured control RTT 360 ms. The downloaded file hash matched the Node streaming source hash. S3 32 MiB: SHA-256 `2192f924af776c33c016258112acca3eebecee139c534cefa8229a3e455cb972`, reconnect requested exactly 255 missing chunks, verify 1,053 ms, working set 652.4 MiB. S3 500 MiB: SHA-256 `8ef7b878120c20d4feb6b8d974e408335c15e1ff6abb0f72e6e5e01bb71da24a`, revalidated 1,000 durable chunks and requested exactly 1,000 missing chunks, completed reopen showed 2,000/2,000 and zero REQUESTs, verify 1,339 ms, working set 1,050.9 MiB. S3 results are single-run observations, not medians. A one-cycle receiver change that sent PONG directly on the control RTCDataChannel measured 325 ms RTT and 1.30 MiB/s, so it was reverted. Measurement quirk to revisit: one hypothesis is that PONG handling is delayed by bulk-frame processing on the receiver main thread.
+
+S4 results are single-run observations on Chrome 154.0.8037.97, Windows, with same-host local signaling and three visible independent receiver profiles for the concurrent test. The unlimited 1-receiver and capped 1-receiver runs measured 4.54 and 4.58 MiB/s; the 2-receiver unlimited run measured 3.60 MiB/s aggregate. In the three-receiver capped run, all three 500 MiB downloads matched SHA-256 `8ef7b878120c20d4feb6b8d974e408335c15e1ff6abb0f72e6e5e01bb71da24a`; aggregate throughput was 1.896 MiB/s with a configured 10 MiB/s cap, so this run did not saturate the cap. The close-one run closed a receiver after exactly 250 MiB durable; the other two completed with matching SHA-256 values. Its sender row returned to zero active sends and zero reserved bytes. Close-run aggregate throughput was 1.935 MiB/s; peak counted sender bytes were 5,760,812 and peak Chrome process working set was 2,590.2 MiB.
+
+S4 bug found during isolation: `pumpFrames()` referenced `tokenBlocked` in the `do…while` condition after declaring it inside the block. The resulting `ReferenceError` was caught as a read failure, causing REJECT/retry loops before payload frames were queued. The flag now has function scope; the one-, two-, and three-receiver browser runs passed after the fix.
+
+OPFS offset probe on HeadlessChrome 154.0.0.0: after `truncate(5,000,000,000)`, an 8-byte write at offset 4,500,000,000 returned 4,294,967,288 (`2^32 - 8`) with all 8 bytes remaining; `getSize()` after truncate was 0. The same return value occurred at the 4,000,000,000 target. This is observed Chrome OPFS backend behavior, not a JavaScript offset cast; it does not establish a 4 GiB-only boundary. No more probing was performed. S2–S4 results are one-run observations, not medians.
 
 ## 14. Approved answers and remaining questions
 
-The five Sub-step 0 questions are resolved: real-device verification is post-S4 with no hosting/certs/flags in S1–S4; disk-full retains verified data/progress and releases memory/handles with a Clear saved data action; explicit Peer config defaults to Google STUN only with no TURN and includes `sdpSemantics`; D1/D5 bounds and manifest layout are accepted; timeout formula and cadence are accepted. S2 is approved; S3 is in progress and stops for review before S4.
+The five Sub-step 0 questions are resolved: real-device verification is post-S4 with no hosting/certs/flags in S1–S4; disk-full retains verified data/progress and releases memory/handles with a Clear saved data action; explicit Peer config defaults to Google STUN only with no TURN and includes `sdpSemantics`; D1/D5 bounds and manifest layout are accepted; timeout formula and cadence are accepted. S2 and S3 are approved. S4 implementation and browser acceptance are complete, pending review; no S5 exists.

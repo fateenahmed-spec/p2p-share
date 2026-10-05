@@ -26,6 +26,7 @@ const requestStates = new Map();
 let pumping = false, debug = new URL(location.href).searchParams.has('debug');
 let uploadBucket, tokenWakeTimer;
 let drawReceiversPending = false;
+let sentPayloadBytes = 0;
 
 function send(control, message) { if (control.open) control.send(encodeControlMessage(message)); }
 function setStatus(message) { status.textContent = message; }
@@ -45,6 +46,7 @@ function publishLink() {
 }
 function renderPeers() {
   document.querySelector('#byte-counts').textContent = String(countedBytes());
+  status.dataset.uploadedPayloadBytes = String(sentPayloadBytes);
   if (!receiverRows.size) { peersLabel.textContent = 'No receivers connected.'; return; }
   for (const session of sessions.values()) {
     const row = receiverRows.get(session.peerId); if (!row) continue;
@@ -255,7 +257,7 @@ function cancelRequest(session, index, attempt) {
 function disconnectSession(session) {
   for (const [key, state] of requestStates) if (state.session === session) requestStates.delete(key);
   budget.disconnect(session.peerId); session.activeSends.clear(); sessions.delete(session.peerId); session.error ||= 'Disconnected';
-  const row = receiverRows.get(session.peerId); if (row) { row.root.classList.add('disconnected'); row.activity.textContent = 'Disconnected; reservations released.'; }
+  const row = receiverRows.get(session.peerId); if (row) { row.root.classList.add('disconnected'); row.root.dataset.activeSends = '0'; row.root.dataset.reservedBytes = '0'; row.activity.textContent = 'Disconnected; reservations released.'; }
   session.bulk?.close(); renderPeers(); pumpTransfers();
 }
 function pumpTransfers() {
@@ -274,6 +276,7 @@ function pumpTransfers() {
         if (!requestStates.has(item.key) || session.activeSends.get(item.key) !== state) { budget.release(item.key); pumpTransfers(); return; }
         state.buffer = buffer; state.stage = 'start'; state.offset = 0; pumpFrames();
       }).catch(error => {
+        if (debug) console.warn('Requested chunk read failed', { index: state.index, attempt: state.attempt, name: error?.name, message: error?.message });
         budget.release(item.key); session.activeSends.delete(item.key); requestStates.delete(item.key);
         const code = error?.name === 'NotReadableError' || error?.name === 'NotFoundError' ? 'FILE_CHANGED' : null;
         if (code) { sendError(session, code, 'The selected source file is no longer readable.'); setStatus('Source file changed or became unreadable; transfer stopped.'); }
@@ -288,9 +291,9 @@ async function readRequestedChunk(state) {
   return currentFile.slice(start, start + state.length).arrayBuffer();
 }
 function pumpFrames() {
-  let progressed;
+  let progressed, tokenBlocked;
   do {
-    progressed = false; let tokenBlocked = false;
+    progressed = false; tokenBlocked = false;
     const candidates = [...sessions.values()];
     for (let visit = 0; visit < candidates.length; visit++) {
       const session = frameCursor.next(candidates, value => value.peerId);
@@ -309,6 +312,8 @@ function pumpFrames() {
         catch (error) { if (debug) console.debug('Direct PeerJS dataChannel.send failed', safeError(error)); session.control.close(); break; }
         progressed = true;
         if (payloadBytes) {
+          sentPayloadBytes += payloadBytes;
+          status.dataset.uploadedPayloadBytes = String(sentPayloadBytes);
           session.speed.add(payloadBytes);
           const row = receiverRows.get(session.peerId);
           if (row) row.speed.textContent = `${(session.speed.bytesPerSecond() / 1024 ** 2).toFixed(2)} MiB/s`;

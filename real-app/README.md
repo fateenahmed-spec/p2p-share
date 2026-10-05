@@ -1,13 +1,22 @@
-# P2P Share — Sub-step 3
+﻿# P2P Share — Sub-step 4
 
-Sub-step 3 adds durable OPFS chunk storage, crash-safe resume metadata, saved-file download and verification, and clear-data controls to the S2 chunked P2P transfer.
+S4 adds sender-side per-receiver rows and grids, fair shared upload limiting, and support for up to 10 simultaneous receivers. The transfer uses two PeerJS connections per receiver: control messages on JSON strings and file frames on ArrayBuffers. The receiver verifies each chunk, writes it durably to OPFS, and resumes missing chunks after a reload.
 
 ## Requirements and support
 
-- Node.js 24.21.0 (`.nvmrc`) and npm.
-- PeerJS 1.5.5 and Playwright 1.63.0 are pinned. PeerJS and its browser dependencies are served from `vendor/`; no CDN scripts are used.
-- A current Chromium based browser on HTTPS or localhost. The page checks secure context, Web Crypto/RNG, workers, text codecs, WebRTC data channels and backpressure events, `File.slice`, and Web Locks. The receiver also checks OPFS sync access handles in a worker, then runs a lock-held read/write probe before accepting a manifest.
-- Missing required features are listed on the page and block the relevant action. Missing Wake Lock, quota estimate/persist, or session storage is reported as an optional limitation.
+- Node.js 24.21.0 (`.nvmrc`) and npm. PeerJS 1.5.5 and Playwright 1.63.0 are pinned and served locally from `vendor/`.
+- Current Chromium-based desktop browser on HTTPS or localhost. Pages detect required APIs, including WebRTC, workers, Web Crypto, Web Locks, and receiver OPFS sync access handles.
+- The 256 GiB application ceiling is a protocol/code limit, not a tested support claim. Chrome 154 on Windows completed 500 MiB transfers with up to three local receivers. OPFS behavior around 4 GB is unreliable in this Chrome build; see the measured limitation below.
+
+| Feature | Status | Evidence |
+|---|---|---|
+| Chromium desktop, localhost | Measured | Chrome 154.0.8037.97, Windows; 500 MiB, one to three receivers |
+| Three simultaneous receivers | Measured | All three 500 MiB downloads verified by external SHA-256 |
+| Ten receiver admission limit | Unit tested | 11th receiver receives ROOM_FULL and is closed |
+| Upload cap | Implemented; browser-tested below configured ceiling | 10 MiB/s setting; three-receiver aggregate observed 1.90 MiB/s |
+| Resume and completed reopen | Measured | S3 500 MiB resume and all-verified reopen passed |
+| Chrome OPFS writes around 4 GB | Known browser/backend failure | Partial-write return count was 4,294,967,288 for an 8-byte write at tested large offsets |
+| Other browsers, mobile, physical LAN, TURN relay | Not measured | No compatibility or performance claim |
 
 ## Run locally
 
@@ -19,54 +28,58 @@ npm test
 npm run dev
 ```
 
-To use local signaling, copy `config.example.json` to ignored `config.local.json` and set its signaling fields to `{"host":"localhost","port":9001,"path":"/","key":"peerjs","secure":false}`. Keep the Google STUN entry. In another terminal run:
+Copy `config.example.json` to ignored `config.local.json` and set signaling to `{"host":"localhost","port":9001,"path":"/","key":"peerjs","secure":false}`. Keep Google STUN. In another terminal run `npm run signal`, then open `http://localhost:9000/sender.html`.
 
-```powershell
-npm run signal
-```
+Choose a file. The sender hashes chunks in a worker and only reveals the share link once the file ID is known. Open the link in receiver profiles. The sender row shows the full raw PeerJS ID, a BITFIELD/HAVE chunk grid, percent complete, recent speed, the control and bulk connection paths, and errors. Disconnected rows stay visible in grey. The global upload cap is configured in KiB/s; zero means unlimited.
 
-Open `http://localhost:9000/sender.html`. Choose a non-empty file. The sender hashes one chunk at a time in a worker; it reveals the link only after the canonical manifest and `fileId` are ready. Open the link in a second tab. The receiver verifies and stores chunks in OPFS and resumes missing chunks on reload.
-
-Generate the deterministic 5 MiB acceptance file and its streaming SHA-256 with:
-
-```powershell
-node scripts/make-test-file.js
-```
-
-Run the complete local browser acceptance check with:
+Acceptance commands:
 
 ```powershell
 npm run acceptance:s1
+npm run acceptance:s2
+npm run acceptance:s3
+npm run acceptance:s4
+node scripts/s3-offset-probe.mjs
 ```
 
-It starts the local app and signaling servers on temporary ports, uses the installed Chrome channel, creates a 5 MiB test file, prints the acceptance result, and removes its `scratch/` file afterward. It serves a temporary local signaling override in memory and does not overwrite `config.local.json`.
+S4 acceptance opens three visible Chrome windows in independent persistent profiles, hashes all three completed downloads, then performs a second 500 MiB run that closes one receiver around 50% while the others finish. The offset probe measures OPFS truncate/write behavior without transferring a large file. Browser automation requires permission to start local processes and Chrome.
 
-S3 acceptance is run with `npm run acceptance:s3`. It uses local signaling and a generated 500 MiB source file; it exercises durable resume, completed-file reopen, download hash comparison, quota rejection, and (when the reported origin quota is large enough) an OPFS offset probe past 4 GiB.
+## Identity, file ID, and privacy
 
-## Identity, link, and file ID
+The sender persists a 128-bit lowercase hexadecimal PeerJS ID in local storage and holds `p2p-send:<id>` using Web Locks. Share links contain exactly one `room` value (the raw PeerJS ID) and one lowercase 64-character `fid`.
 
-The sender persists a 128-bit lowercase hexadecimal PeerJS ID in local storage and holds the exclusive Web Lock `p2p-send:<id>` before creating its Peer. Refreshing retains the same ID and link. A share URL contains exactly one `room` (the raw PeerJS sender ID) and one lowercase 64-character `fid`; duplicate, extra, or malformed parameters are rejected.
+`fid` is SHA-256 of the canonical manifest. It covers the original UTF-8 file name bytes, size, and chunk hashes; names are not Unicode-normalized. A renamed copy has a different `fileId`, even if its bytes are unchanged. Displayed names and peer IDs use text nodes, not HTML parsing.
 
-`fid` is SHA-256 of the canonical manifest. It binds the file's original UTF-8 name bytes and size as well as its chunk hashes; names are not Unicode-normalized. Display text is sanitized and written with `textContent`. S1 rejects empty files and enforces the design's 256 GiB, 65,536 chunk, and 4096 UTF-8-byte name limits.
+Google STUN is the default; no TURN server is added unless a user supplies one. ICE settings stay in per-tab session storage. Peers can learn one another's network addresses through ICE. A user-supplied TURN server can observe relayed traffic metadata and bytes. The signaling service coordinates peers; it does not carry WebRTC data-channel payloads.
 
-## ICE and privacy
+## Threat model and limitations
 
-The application always supplies explicit WebRTC configuration: Google STUN only by default, `sdpSemantics: "unified-plan"`, and no TURN. User-entered ICE URLs and credentials are stored in per-tab `sessionStorage`; settings apply after reconnect. Credentials are not written into the URL, config example, logs, or diagnostics. Same-origin scripts can read session storage, so the pages load no third-party scripts. Peers expose their IP addresses to one another; a TURN server can see relayed traffic metadata and bytes.
+- A malicious sender can waste bandwidth or provide invalid data. Manifest and chunk hashes detect mismatch; bounded frames, queues, receiver limits, and retry caps limit resource use. The file ID does not authenticate a sender.
+- Same-origin scripts can access OPFS files and session settings. The app uses a restrictive CSP and loads no third-party scripts. A local attacker with profile access can read or delete saved files; the app does not encrypt OPFS data.
+- Disk-full preflight uses `navigator.storage.estimate()` and fails closed when available quota is below the computed requirement. If estimate fails, it warns and proceeds. Clear saved data reacquires the file Web Lock if the preflight released it.
+- Custom signaling hosts must be added to both pages' CSP `connect-src` allow-list. PeerJS has no ICE restart; network changes require reconnect/resume.
+- Very large object URL behavior, physical LAN performance, relay behavior, mobile browsers, and real-device transfers are not measured.
 
-PeerJS 1.5.5's default configuration includes public static-credential TURN servers. The explicit app configuration replaces those defaults, so those servers are not used unless the user supplies them.
+## Measured results
 
-## Measured earlier acceptance
+All transfer results below are single-run observations, not medians. Chrome 154.0.8037.97 and a same-host local PeerServer were used unless noted.
 
-S1 on 2026-10-05 used headless Chrome 154.0.8037.97 and local PeerServer. The sender hashed 5,242,880 bytes; the receiver verified the manifest, displayed the expected name/size, paired both channels, and exchanged BITFIELD. Measured control RTT was 4 ms; S1 did not transfer payload bytes.
+| Stage | File | Time / throughput | Verification and resume | Memory / other |
+|---|---:|---|---|---|
+| S2 | 32 MiB | 23,786 ms; 1.35 MiB/s; 8/8 request slots | Source and receiver SHA-256 matched | RTT 360 ms |
+| S3 | 32 MiB | 11,310 ms; 2.83 MiB/s | SHA-256 `2192f924af776c33c016258112acca3eebecee139c534cefa8229a3e455cb972`; reconnect requested exactly 255 missing chunks; verify 1,053 ms | Chrome working set 652.4 MiB |
+| S3 | 500 MiB | 191,640 ms; 2.61 MiB/s | SHA-256 `8ef7b878120c20d4feb6b8d974e408335c15e1ff6abb0f72e6e5e01bb71da24a`; revalidated 1,000 durable chunks and requested exactly 1,000 missing; completed reopen had 2,000/2,000, 100%, zero REQUESTs; verify 1,339 ms | Chrome working set 1,050.9 MiB |
+| S3 OPFS offset probe | Truncate 5,000,000,000; 8-byte write at large offset | Failed on HeadlessChrome 154.0.0.0 | `getSize()` after truncate was 0; write returned 4,294,967,288 (`2^32 - 8`) with 8 bytes remaining at offset 4,500,000,000; same return at 4,000,000,000 target. Quota estimate: 10 GiB, usage 0. | JS offsets remained safe integers. This does not establish a 4 GiB-only boundary; observed OPFS backend behavior is inconsistent with the write request. |
+| S4 one receiver, unlimited | 500 MiB | 4.54 MiB/s | 2,000 requests; downloaded SHA-256 matched | Single run |
+| S4 one receiver, 10 MiB/s cap | 500 MiB | 4.58 MiB/s | 2,000 requests; downloaded SHA-256 matched | Below cap; sender throughput did not saturate it |
+| S4 two receivers, unlimited | 500 MiB each | 3.60 MiB/s aggregate | Both downloaded SHA-256 values matched | Single run |
+| S4 three receivers, 10 MiB/s cap | 500 MiB each | 1.90 MiB/s aggregate | All three hashes matched; expected and downloaded SHA-256 for each: `8ef7b878120c20d4feb6b8d974e408335c15e1ff6abb0f72e6e5e01bb71da24a` | Peak counted sender bytes 5,760,812; peak Chrome process working set 2,590.2 MiB |
+| S4 close one receiver | 500 MiB each; one closed at 250 MiB | 1.93 MiB/s aggregate during close run | Remaining two completed with matching SHA-256; disconnected row returned to 0 active sends / 0 reserved bytes | Same 10 MiB/s configured cap |
 
-S2 transferred 33,554,432 bytes in 23,786 ms after the first REQUEST, at 1.35 MiB/s, with 8/8 in-flight requests, using Chrome 154.0.8037.97 and a same-host local PeerServer. Receiver SHA-256 matched the Node streaming hash. Measured control RTT was 360 ms. A direct-PONG trial measured 325 ms RTT but 1.30 MiB/s, so it was reverted. The high localhost RTT remains a measurement quirk to revisit after S4; one hypothesis is PONG delay from bulk processing on the receiver main thread.
+The disk-full browser simulation remains blocked: Chrome CDP `Storage.overrideQuotaForOrigin` returned `Protocol error (Storage.overrideQuotaForOrigin): Internal error`. The production preflight is unit-tested with injected estimates for 64 MiB and 2 GiB available against a 500 MiB file, plus estimate rejection.
 
-## Saved-file download trade-offs
+The S4 transfer bug was caused by `tokenBlocked` being declared inside `pumpFrames()`'s `do` block but read from the `do…while` condition outside it. That raised `ReferenceError` after the first queued frame and was misclassified as a chunk read failure. The flag now has function scope; the 500 MiB one-, two-, and three-receiver browser runs passed after the fix.
 
-The default Download action gets an OPFS `File`, creates an object URL, and clicks a temporary anchor. This is simple and avoids copying file bytes through JavaScript, but very large object-URL behavior varies by browser and may require additional disk space. Where `showSaveFilePicker` is available, Save As streams the OPFS file to a user-selected writable file and displays progress; the browser prompts for a destination and the copy still needs roughly another file size of free disk. Neither download path changes the retained OPFS copy. Use Clear saved data when that copy is no longer needed.
+## Saved-file download
 
-## Current limits
-
-- Sender PING/PONG RTT is diagnostic only; D14 dead-peer recovery is not implemented.
-- Custom signaling hosts must be added to both pages' CSP `connect-src` allow-list.
-- Physical-LAN performance, multi-gigabyte transfers, relay behavior, Chrome Task Manager steady-state memory, and real-device transfers remain unmeasured.
+Download creates an object URL from the OPFS `File`; large object-URL behavior may vary and the downloaded copy needs additional disk. Where available, Save As streams the file to a user-selected destination. Neither action deletes the retained OPFS copy; use Clear saved data when it is no longer needed.

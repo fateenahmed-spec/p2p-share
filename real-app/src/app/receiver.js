@@ -172,7 +172,10 @@ function onBulk(raw) {
 function onHashMessage(event) {
   const result = event.data;
   if (!['CHUNK_HASH_OK', 'CHUNK_HASH_MISMATCH'].includes(result?.type) || scheduler?.inFlight.get(result.index)?.attempt !== result.attempt) return;
-  if (result.type === 'CHUNK_HASH_MISMATCH') { retryChunk(result.index, result.attempt); return; }
+  if (result.type === 'CHUNK_HASH_MISMATCH') {
+    if (new URL(location.href).searchParams.get('debug') === '1') console.warn('Chunk hash mismatch', { index: result.index, attempt: result.attempt, actual: result.actual, expected: result.expectedHash });
+    retryChunk(result.index, result.attempt); return;
+  }
   const requestKey = `${result.index}:${result.attempt}`;
   pendingWrites.set(requestKey, { index: result.index, attempt: result.attempt, buffer: result.buffer });
   postWrite(requestKey);
@@ -262,7 +265,7 @@ async function startPeerAsync() {
 function pairBulk(connection) {
   bulk = connection; bulk.on('open', updatePairedStatus); bulk.on('data', onBulk);
   bulk.on('error', error => { status.textContent = safeError(error); });
-  bulk.on('close', () => { if (manifestVerified && status.dataset.transferComplete !== 'true') status.textContent = 'Bulk channel disconnected.'; });
+  bulk.on('close', () => { if (manifestVerified && !status.dataset.failed && status.dataset.transferComplete !== 'true') status.textContent = 'Bulk channel disconnected.'; });
   updatePairedStatus(); sendBitfieldAndStart();
 }
 
