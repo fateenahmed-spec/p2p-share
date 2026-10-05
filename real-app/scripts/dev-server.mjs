@@ -8,7 +8,8 @@ createServer(async (req, res) => {
   try {
     const path = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
     if (path === '/favicon.ico') { res.writeHead(204); res.end(); return; }
-    if (path === '/config.local.json' && process.env.P2P_S1_ACCEPTANCE === '1') {
+    const acceptance = process.env.P2P_S1_ACCEPTANCE === '1' || process.env.P2P_S2_ACCEPTANCE === '1';
+    if (path === '/config.local.json' && acceptance) {
       res.writeHead(200, { 'content-type': 'application/json', 'cache-control':'no-store' });
       res.end(JSON.stringify({ signaling: { host: 'localhost', port: Number(process.env.P2P_SIGNAL_PORT || 9001), path: '/', key: 'peerjs', secure: false }, iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }));
       return;
@@ -16,7 +17,7 @@ createServer(async (req, res) => {
     const file = resolve(root, '.' + path);
     if (file !== root && !file.startsWith(root + sep)) throw new Error('forbidden');
     let body = await readFile(file);
-    if (process.env.P2P_S1_ACCEPTANCE === '1' && (path === '/sender.html' || path === '/receiver.html')) {
+    if (acceptance && (path === '/sender.html' || path === '/receiver.html')) {
       const signalPort = Number(process.env.P2P_SIGNAL_PORT);
       body = Buffer.from(body.toString('utf8').replace('http://localhost:9001 ws://localhost:9001', `http://localhost:${signalPort} ws://localhost:${signalPort}`));
     }

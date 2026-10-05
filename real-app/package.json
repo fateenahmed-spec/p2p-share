@@ -7,6 +7,7 @@
     "dev": "node scripts/dev-server.mjs",
     "signal": "node scripts/local-signaling.mjs",
     "acceptance:s1": "node scripts/s1-acceptance.mjs",
+    "acceptance:s2": "node scripts/s2-acceptance.mjs",
     "test": "node --test --test-isolation=none"
   },
   "dependencies": {

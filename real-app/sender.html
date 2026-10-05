@@ -12,6 +12,8 @@
     <section id="share-link" hidden><label>Share link <input id="share-url" readonly size="76"></label><p>File ID: <code id="file-id"></code></p></section>
     <p>Control RTT: <output id="rtt">—</output></p>
     <section aria-live="polite"><h2>Receivers</h2><pre id="peers">No receivers connected.</pre></section>
+    <p>Byte accounting: <output id="byte-counts">0</output> bytes reserved or queued; global cap 67108864, per receiver cap 16777216.</p>
+    <label>Global upload cap, KiB/s (0 = unlimited) <input id="upload-limit" type="number" min="0" max="102400" step="1" value="0"></label>
     <details><summary>ICE settings</summary><form id="ice-settings"><label>ICE URLs, one per line <textarea id="ice-urls" autocomplete="off"></textarea></label><label>Username <input id="ice-username" autocomplete="off"></label><label>Credential <input id="ice-credential" type="password" autocomplete="new-password"></label><label><input id="force-relay" type="checkbox"> Force relay</label><button>Apply &amp; reconnect</button><button type="button" id="clear-settings">Clear</button></form></details>
   </main><script type="module" src="./src/app/sender.js"></script>
 </body></html>

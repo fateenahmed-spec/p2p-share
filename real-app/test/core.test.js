@@ -7,6 +7,13 @@ import { makePeerOptions } from '../src/lib/rtc-config.js';
 import { createRandom } from '../src/lib/random.js';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import { CHUNK_START, CHUNK_DATA, CHUNK_END, encodeFrame, validateFrame, decodeFrame, FrameReassembler } from '../src/lib/frames.js';
+import { chunkFileOffset, chunkLength } from '../src/lib/offsets.js';
+import { encodeBitfield, decodeBitfield, HolderSet } from '../src/lib/bitfield.js';
+import { TokenBucket } from '../src/lib/token-bucket.js';
+import { RequestLedger, RequestScheduler } from '../src/lib/request-scheduler.js';
+import { ByteBudget } from '../src/lib/byte-budget.js';
+import { createMemorySink, MEMORY_SINK_LIMIT } from '../src/test-only/memory-sink.js';
 
 test('manifest encodes, parses, and hashes canonical bytes including size above 2^32', async () => {
   const h = new Uint8Array(32).fill(7), size = 4294967296 + 5, chunkSize = 4294967295;
@@ -81,4 +88,181 @@ test('random range reduction maps exhaustive small fake-source values evenly and
   const { readdir, readFile } = await import('node:fs/promises'); const { fileURLToPath } = await import('node:url'); const { join } = await import('node:path');
   async function files(dir) { const out = []; for (const ent of await readdir(dir, { withFileTypes: true })) { const p = join(dir, ent.name); if (ent.isDirectory()) out.push(...await files(p)); else if (ent.name.endsWith('.js')) out.push(await readFile(p, 'utf8')); } return out; }
   assert.equal((await files(fileURLToPath(new URL('../src/', import.meta.url)))).some(source => /Math\s*\.\s*random\s*\(/.test(source)), false);
+});
+
+test('bulk frame header is ten-byte big-endian and reassembles a requested chunk', async () => {
+  const startPayload = new Uint8Array(4); new DataView(startPayload.buffer).setUint32(0, 5, false);
+  const start = validateFrame(encodeFrame({ type: CHUNK_START, attempt: 2, index: 0x10203, offset: 0, payload: startPayload }));
+  assert.equal(start.type, CHUNK_START); assert.equal(start.attempt, 2); assert.equal(start.index, 0x10203); assert.equal(start.offset, 0);
+  const source = new Uint8Array([1, 2, 3, 4, 5]);
+  const reassembler = new FrameReassembler({ maxInFlight: 8 });
+  assert.equal(reassembler.request(0, 0, source.length), true);
+  assert.equal(reassembler.accept(encodeFrame({ type: CHUNK_START, attempt: 0, index: 0, offset: 0, payload: startPayload })).status, 'started');
+  assert.equal(reassembler.accept(encodeFrame({ type: CHUNK_DATA, attempt: 0, index: 0, offset: 0, payload: source.subarray(0, 3) })).received, 3);
+  assert.equal(reassembler.accept(encodeFrame({ type: CHUNK_DATA, attempt: 0, index: 0, offset: 3, payload: source.subarray(3) })).received, 5);
+  const complete = reassembler.accept(encodeFrame({ type: CHUNK_END, attempt: 0, index: 0, offset: 5, payload: new Uint8Array() }));
+  assert.equal(complete.status, 'complete'); assert.deepEqual(complete.buffer, source);
+  const expectedHash = createHash('sha256').update(source).digest('hex');
+  assert.equal(createHash('sha256').update(complete.buffer).digest('hex'), expectedHash);
+  assert.notEqual(createHash('sha256').update(new Uint8Array([9, 2, 3, 4, 5])).digest('hex'), expectedHash);
+  assert.equal(await fileId(new Uint8Array(complete.buffer)), await fileId(source));
+});
+
+test('frame validator rejects wrong lengths, types, offsets, and payloads', () => {
+  const payload = new Uint8Array(4); new DataView(payload.buffer).setUint32(0, 1, false);
+  assert.throws(() => encodeFrame({ type: 9, attempt: 0, index: 0, offset: 0, payload }));
+  assert.throws(() => encodeFrame({ type: CHUNK_START, attempt: 64, index: 0, offset: 0, payload }));
+  assert.throws(() => encodeFrame({ type: CHUNK_START, attempt: 0, index: 0, offset: 1, payload }));
+  assert.throws(() => encodeFrame({ type: CHUNK_END, attempt: 0, index: 0, offset: 0, payload }));
+  assert.equal(decodeFrame(new Uint8Array(9)).ok, false);
+  assert.equal(decodeFrame(new Uint8Array(16395)).ok, false);
+});
+
+test('chunk offset math remains exact across u32 boundaries and near 2^53', () => {
+  assert.equal(chunkFileOffset(1, 4294967295), 4294967295);
+  assert.equal(chunkFileOffset(1, 4294967296), 4294967296);
+  assert.equal(chunkFileOffset(1, 4294967297), 4294967297);
+  assert.equal(chunkFileOffset(Number.MAX_SAFE_INTEGER, 1), Number.MAX_SAFE_INTEGER);
+  assert.throws(() => chunkFileOffset(Number.MAX_SAFE_INTEGER, 2));
+  assert.equal(chunkLength(4294967297, 4294967296, 1), 1);
+  assert.equal(chunkLength(9007199254740991, 1, 9007199254740990), 1);
+});
+
+test('bitfields encode/decode all-ones snapshots and holder deltas', () => {
+  const all = encodeBitfield(9, Array.from({ length: 9 }, (_, i) => i));
+  assert.equal(all, 'ff01'); assert.deepEqual(decodeBitfield(9, all), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.throws(() => decodeBitfield(9, 'ff81'));
+  assert.throws(() => decodeBitfield(9, 'FF01'));
+  const holders = new HolderSet(9); holders.replaceFromBitfield('0100'); holders.add([8]); holders.remove(0);
+  assert.deepEqual([...holders.indices], [8]);
+});
+
+test('control validator covers every S2 control message schema', () => {
+  const messages = [
+    { type: 'HELLO', role: 'receiver', protocolVersion: 1 },
+    { type: 'MANIFEST_START', name: 'a', size: 1, chunkSize: 1, chunkCount: 1, fileId: 'a'.repeat(64), manifestBytes: 1 },
+    { type: 'MANIFEST_DATA', seq: 0, data: '00' }, { type: 'MANIFEST_END', parts: 1 },
+    { type: 'REQUEST', index: 0, attempt: 63 }, { type: 'HAVE', indices: [0] },
+    { type: 'BITFIELD', hex: '01' }, { type: 'CANCEL', index: 0, attempt: 1 },
+    { type: 'REJECT', index: 0, attempt: 1, reason: 'NOT_HAVE' },
+    { type: 'PING', seq: 0 }, { type: 'PONG', seq: 0 },
+    { type: 'ERROR', code: 'PROTOCOL', message: 'invalid' },
+  ];
+  for (const message of messages) assert.deepEqual(parseControlMessage(encodeControlMessage(message)), message);
+  for (const message of [
+    { type: 'REQUEST', index: -1, attempt: 0 }, { type: 'REQUEST', index: 0, attempt: 64 },
+    { type: 'HAVE', indices: [1, 1] }, { type: 'REJECT', index: 0, attempt: 0, reason: 'NOPE' },
+    { type: 'MANIFEST_END', parts: -1 }, { type: 'PING', seq: Number.MAX_SAFE_INTEGER + 1 },
+  ]) assert.throws(() => encodeControlMessage(message));
+});
+
+test('request ledger handles duplicate, stale, superseded, and capped attempts', () => {
+  const ledger = new RequestLedger();
+  assert.equal(ledger.observe(4, 0), 'new');
+  assert.equal(ledger.observe(4, 0), 'duplicate');
+  assert.equal(ledger.observe(4, 2), 'superseded');
+  assert.equal(ledger.observe(4, 1), 'stale');
+  assert.equal(ledger.observe(4, 64), 'exhausted');
+  assert.equal(ledger.current(4, 2), true);
+});
+
+test('request scheduler randomizes order, limits in-flight work, retries failures, and uses injected clock', () => {
+  let now = 0;
+  const rng = createRandom(words => words.fill(0));
+  const scheduler = new RequestScheduler({ chunkCount: 10, maxInFlight: 8, rng, clock: () => now });
+  scheduler.replaceHolders(Array.from({ length: 10 }, (_, i) => i));
+  const first = Array.from({ length: 8 }, () => scheduler.next());
+  assert.equal(new Set(first.map(x => x.index)).size, 8); assert.equal(scheduler.next(), null);
+  now = 100;
+  const expired = scheduler.expire(100);
+  assert.equal(expired.length, 8); assert.ok(expired.every(x => x.status === 'retry'));
+  scheduler.next(); scheduler.next(); // Two unrequested chunks remained before the retry queue.
+  const retry = scheduler.next(); assert.ok(retry); assert.equal(retry.index, first[0].index); assert.equal(retry.attempt, 1);
+  assert.equal(scheduler.complete(retry.index, 0).status, 'stale');
+  assert.equal(scheduler.complete(retry.index, 1).status, 'verified');
+  for (let failure = 0; failure < 2; failure++) {
+    const request = scheduler.next(); assert.ok(request);
+    const result = scheduler.fail(request.index, request.attempt);
+    if (request.index === retry.index) assert.equal(result.status, 'retry');
+  }
+});
+
+test('scheduler fails a chunk after three bad attempts and marks unavailable chunks failed', () => {
+  const rng = createRandom(words => words.fill(0));
+  const scheduler = new RequestScheduler({ chunkCount: 1, maxInFlight: 1, rng, clock: () => 0 });
+  scheduler.replaceHolders([0]);
+  let request = scheduler.next(); assert.deepEqual(request, { index: 0, attempt: 0 });
+  assert.equal(scheduler.fail(0, 0).status, 'retry');
+  request = scheduler.next(); assert.equal(request.attempt, 1);
+  assert.equal(scheduler.fail(0, 1).status, 'retry');
+  request = scheduler.next(); assert.equal(request.attempt, 2);
+  assert.equal(scheduler.fail(0, 2).status, 'failed');
+  assert.equal(scheduler.next(), null);
+
+  const unavailable = new RequestScheduler({ chunkCount: 1, maxInFlight: 1, rng, clock: () => 0 });
+  unavailable.replaceHolders([0]);
+  const pending = unavailable.next();
+  assert.equal(unavailable.markUnavailable(pending.index, pending.attempt).status, 'failed');
+  assert.equal(unavailable.failed.has(0), true);
+});
+
+test('token bucket uses lazy refill and an injected monotonic clock', () => {
+  let now = 0;
+  const bucket = new TokenBucket({ rateBytesPerSecond: 1000, burstBytes: 500, now: () => now });
+  assert.equal(bucket.take(500), true); assert.equal(bucket.take(1), false); assert.equal(bucket.delayFor(250), 250);
+  now = 250; assert.equal(bucket.take(250), true); assert.equal(bucket.tokens, 0);
+});
+
+test('byte budget keeps ten receivers within global and per-peer caps and releases on disconnect', () => {
+  const budget = new ByteBudget(); const peers = Array.from({ length: 10 }, (_, i) => `peer-${i}`);
+  const remaining = new Map(peers.map(peer => [peer, 16])); const progress = new Map(peers.map(peer => [peer, 0]));
+  for (const peer of peers) for (let i = 0; i < 16; i++) budget.enqueue(peer, `${peer}-${i}`, 1024 ** 2);
+  while ([...remaining.values()].some(n => n > 0)) {
+    const grant = budget.grantNext();
+    if (grant) {
+      progress.set(grant.peerId, progress.get(grant.peerId) + grant.bytes);
+      remaining.set(grant.peerId, remaining.get(grant.peerId) - 1);
+      assert.ok(budget.reservedBytes() <= 64 * 1024 ** 2);
+      for (const peer of peers) assert.ok(budget.reservedBytes(peer) <= 16 * 1024 ** 2);
+    }
+    for (const key of [...budget.reservations.keys()]) budget.release(key);
+  }
+  assert.ok(peers.every(peer => progress.get(peer) === 16 * 1024 ** 2));
+  budget.enqueue('gone', 'gone-1', 1024); budget.grantNext(); budget.disconnect('gone');
+  assert.equal(budget.reservedBytes('gone'), 0);
+});
+
+test('memory sink rejects over-limit files before calling its allocator', () => {
+  let allocated = false;
+  assert.throws(() => createMemorySink(MEMORY_SINK_LIMIT + 1, () => { allocated = true; throw new Error('allocated'); }));
+  assert.equal(allocated, false);
+  const sink = createMemorySink(4); sink.write(0, 0, new Uint8Array([1, 2, 3, 4]));
+  assert.deepEqual(sink.view(), new Uint8Array([1, 2, 3, 4]));
+});
+
+test('fuzzed frame and control decoders reject arbitrary input without throwing', () => {
+  let state = 0x51a2b3c4;
+  function nextByte() { state = (state * 1664525 + 1013904223) % 4294967296; return Math.floor(state / 16777216); }
+  for (let n = 0; n < 2000; n++) {
+    const length = n % 17000, bytes = new Uint8Array(length);
+    for (let i = 0; i < length; i++) bytes[i] = nextByte();
+    assert.doesNotThrow(() => decodeFrame(bytes));
+    const text = n % 4 === 0 ? new TextDecoder().decode(bytes.subarray(0, Math.min(length, 65536))) : JSON.stringify({ type: 'PING', seq: nextByte() });
+    assert.doesNotThrow(() => { try { parseControlMessage(text); } catch { /* Invalid input is expected. */ } });
+  }
+  const oversized = new Uint8Array(16395); assert.equal(decodeFrame(oversized).ok, false);
+});
+
+test('source forbids bitwise operators except in the bitfield module', async () => {
+  const { readdir, readFile } = await import('node:fs/promises'); const { fileURLToPath } = await import('node:url'); const { join, relative } = await import('node:path');
+  async function files(dir) { const out = []; for (const ent of await readdir(dir, { withFileTypes: true })) { const path = join(dir, ent.name); if (ent.isDirectory()) out.push(...await files(path)); else if (/\.js$/.test(ent.name)) out.push({ path, source: await readFile(path, 'utf8') }); } return out; }
+  const sources = await files(fileURLToPath(new URL('../src/', import.meta.url)));
+  const forbidden = /(?<!&)&(?!&)|(?<!\|)\|(?!\|)|\^|~|<<|>>/;
+  for (const { path, source } of sources) if (!relative(fileURLToPath(new URL('../src/', import.meta.url)), path).replaceAll('\\', '/').endsWith('lib/bitfield.js')) {
+    const code = source
+      .replace(/(['"`])(?:\\[\s\S]|(?!\1)[^\\])*?\1/g, ' ')
+      .replace(/\/[^/\\\r\n]*(?:\\.[^/\\\r\n]*)*\/[dgimsuvy]*/g, ' ')
+      .replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, ' ');
+    assert.equal(forbidden.test(code), false, `forbidden bitwise operator in ${path}`);
+  }
 });
