@@ -19,6 +19,9 @@ import { fileEntryNames } from '../src/lib/storage-names.js';
 import { checkAvailableStorage } from '../src/lib/storage-preflight.js';
 import { clearWithFileLock } from '../src/lib/receiver-lock.js';
 import { createDebugLogRing } from '../src/lib/debug-log.js';
+import { admitReceiver, MAX_RECEIVERS } from '../src/lib/receiver-admission.js';
+import { RoundRobinCursor } from '../src/lib/round-robin.js';
+import { SpeedWindow } from '../src/lib/speed-window.js';
 
 test('manifest encodes, parses, and hashes canonical bytes including size above 2^32', async () => {
   const h = new Uint8Array(32).fill(7), size = 4294967296 + 5, chunkSize = 4294967295;
@@ -378,4 +381,54 @@ test('Clear reacquires a released receiver lock and never clears without one', a
 test('debug log ring retains only the newest entries', () => {
   const ring = createDebugLogRing(2); ring.add(1); ring.add(2); ring.add(3);
   assert.deepEqual(ring.list(), [2, 3]);
+});
+
+test('11th receiver gets ROOM_FULL and is closed', () => {
+  let closed = false, sent;
+  assert.equal(admitReceiver(MAX_RECEIVERS, { sendError: message => { sent = message; }, close: () => { closed = true; } }), false);
+  assert.deepEqual(sent, { type: 'ERROR', code: 'ROOM_FULL', message: 'This sender already has the maximum number of receivers.' });
+  assert.equal(closed, true);
+  assert.equal(admitReceiver(MAX_RECEIVERS - 1, { sendError() {}, close() {} }), true);
+});
+
+test('round-robin cursor rotates deterministically across changing receiver sets', () => {
+  const cursor = new RoundRobinCursor(), peers = ['a', 'b', 'c'];
+  assert.deepEqual(Array.from({ length: 6 }, () => cursor.next(peers)), ['a', 'b', 'c', 'a', 'b', 'c']);
+  assert.deepEqual(Array.from({ length: 4 }, () => cursor.next(['a', 'c'])), ['a', 'c', 'a', 'c']);
+});
+
+test('per-receiver one-second speed window includes bursts and expires old samples', () => {
+  let now = 0; const speed = new SpeedWindow({ now: () => now });
+  speed.add(100_000); now = 200; speed.add(200_000); now = 500; speed.add(700_000);
+  assert.equal(speed.bytesPerSecond(), 1_000_000);
+  now = 1001;
+  assert.equal(speed.bytes(), 900_000);
+  now = 1500;
+  assert.equal(speed.bytes(), 700_000);
+  assert.equal(speed.bytesPerSecond(), 700_000);
+});
+
+test('shared token bucket with three round-robin consumers respects aggregate rate', () => {
+  const consumers = ['a', 'b', 'c'], totals = new Map(consumers.map(id => [id, 0]));
+  const cursor = new RoundRobinCursor(); let now = 0;
+  const bucket = new TokenBucket({ rateBytesPerSecond: 30_000, burstBytes: 32_788, now: () => now });
+  for (let step = 0; step < 100; step++) {
+    now += 550;
+    const id = cursor.next(consumers);
+    if (bucket.take(16_394)) totals.set(id, totals.get(id) + 16_394);
+  }
+  const total = [...totals.values()].reduce((a, b) => a + b, 0);
+  assert.ok(total <= 32_788 + 30_000 * (now / 1000));
+  assert.ok([...totals.values()].every(value => value > 0));
+  assert.ok(Math.max(...totals.values()) - Math.min(...totals.values()) <= 16_394);
+});
+
+test('byte budget round-robin grants make progress for three queued receivers', () => {
+  const budget = new ByteBudget({ globalLimit: 6, peerLimit: 2 });
+  for (const id of ['a', 'b', 'c']) for (let n = 0; n < 2; n++) budget.enqueue(id, `${id}${n}`, 2);
+  const order = [];
+  for (let i = 0; i < 3; i++) { const item = budget.grantNext(); order.push(item.peerId); }
+  assert.deepEqual(order, ['a', 'b', 'c']);
+  for (const item of [...budget.reservations.keys()]) budget.release(item);
+  assert.deepEqual(new Set(['a', 'b', 'c'].map(id => budget.grantNext()?.peerId)), new Set(['a', 'b', 'c']));
 });
