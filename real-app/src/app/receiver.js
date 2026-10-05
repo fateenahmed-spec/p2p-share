@@ -250,6 +250,7 @@ async function startPeerAsync() {
     peer?.destroy(); control = bulk = undefined; expectedSession = undefined;
     const config = await loadConfig(); peer = new Peer(undefined, peerOptions(config.signaling, config.options));
     peer.on('open', () => {
+      status.dataset.peerId = peer.id;
       control = peer.connect(link.room, { reliable: true, serialization: 'raw', metadata: { kind: 'control' } });
       control.on('open', () => { send({ type: 'HELLO', role: 'receiver', protocolVersion: 1 }); startPings(control, ms => { rtt.textContent = `${ms} ms`; }); status.textContent = 'Connected; waiting for sender HELLO.'; });
       control.on('data', raw => onControl(raw)); control.on('error', error => { status.textContent = safeError(error); });

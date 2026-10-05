@@ -57,6 +57,8 @@ function renderPeers() {
     row.paths.textContent = `control ${session.controlPath || 'unknown'}; bulk ${session.bulkPath || 'waiting'}`;
     row.activity.textContent = `${session.bulk?.open ? 'paired' : 'waiting for bulk'}; ${session.activeSends.size} active sends; ${session.requestCount} REQUESTs served`;
     row.error.textContent = session.error || '';
+    row.root.dataset.activeSends = String(session.activeSends.size);
+    row.root.dataset.reservedBytes = String(budget.reservedBytes(session.peerId));
     row.root.classList.remove('disconnected');
   }
   queueReceiverDraw();

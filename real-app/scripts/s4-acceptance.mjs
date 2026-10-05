@@ -10,10 +10,12 @@ const scratch = `${cwd}scratch`, size = Number(process.env.P2P_S4_TEST_SIZE || 5
 const receiverCount = Number(process.env.P2P_S4_RECEIVERS || 3);
 const uploadLimitKiB = Number(process.env.P2P_S4_UPLOAD_LIMIT_KIB || 10240);
 const isolationOnly = process.env.P2P_S4_ISOLATION === '1';
+const closeOnly = process.env.P2P_S4_CLOSE_ONLY === '1';
+const initialSize = closeOnly ? Number(process.env.P2P_S4_INITIAL_SIZE || 1024 ** 2) : size;
 const sourcePath = `${scratch}\\test-s4-500m.bin`;
 const closeTestPath = `${scratch}\\test-s4-close-500m.bin`;
 const receiverPaths = [0, 1, 2].map(index => `${scratch}\\download-s4-${index}.bin`);
-const logs = { app: [], signal: [] }, contexts = [], pages = [], browsers = new Set(), memorySamples = [];
+const logs = { app: [], signal: [] }, contexts = [], receiverContexts = [], pages = [], browsers = new Set(), memorySamples = [];
 let appServer, signalServer, appPort, signalPort, sampling = true, peakCountedBytes = 0, monitor;
 function start(args, bucket, env) {
   const child = spawn(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
@@ -74,7 +76,7 @@ function attachDiagnostics(page) {
 }
 try {
   await mkdir(scratch, { recursive: true });
-  const generated = await makeTestFile(sourcePath, size);
+  const generated = await makeTestFile(sourcePath, initialSize);
   const closeTest = isolationOnly ? undefined : await makeTestFile(closeTestPath, size);
   appPort = await freePort(); do { signalPort = await freePort(); } while (signalPort === appPort);
   const env = { ...process.env, P2P_S3_ACCEPTANCE: '1', P2P_DEV_PORT: String(appPort), P2P_SIGNAL_PORT: String(signalPort) };
@@ -100,7 +102,7 @@ try {
       viewport: { width: 600, height: 850 },
       args: [`--window-size=620,920`, `--window-position=${index * 630},0`, '--no-first-run', '--no-default-browser-check'],
     });
-    contexts.push(context); const browser = context.browser(); if (browser) browsers.add(browser);
+    contexts.push(context); receiverContexts.push(context); const browser = context.browser(); if (browser) browsers.add(browser);
     const page = context.pages()[0] || await context.newPage(); pages.push(page); attachDiagnostics(page);
     await page.goto(shareLink, { waitUntil: 'domcontentloaded' });
     await waitForPage(page, () => document.querySelector('#status')?.dataset.missingChunks !== undefined, 60000);
@@ -122,20 +124,22 @@ try {
   })();
 
   const firstPhaseStart = Number(await sender.locator('#status').getAttribute('data-uploaded-payload-bytes')) || 0;
-  await Promise.all(receiverLinks.map(page => waitForPage(page, () => document.querySelector('#status')?.dataset.transferComplete === 'true', 20 * 60 * 1000)));
-  const firstPhaseEnd = Number(await sender.locator('#status').getAttribute('data-uploaded-payload-bytes'));
-  const firstHashes = [];
-  for (let index = 0; index < receiverCount; index++) {
-    const downloadEvent = receiverLinks[index].waitForEvent('download', { timeout: 120000 });
-    await receiverLinks[index].locator('#download-file').click();
-    const download = await downloadEvent; await download.saveAs(receiverPaths[index]);
-    firstHashes.push({ receiver: index + 1, sha256: externalSha256(receiverPaths[index]) });
+  let firstPhaseEnd = firstPhaseStart, firstHashes = [], firstPhaseRateMiBPerSecond = null;
+  if (!closeOnly) {
+    await Promise.all(receiverLinks.map(page => waitForPage(page, () => document.querySelector('#status')?.dataset.transferComplete === 'true', 20 * 60 * 1000)));
+    firstPhaseEnd = Number(await sender.locator('#status').getAttribute('data-uploaded-payload-bytes'));
+    for (let index = 0; index < receiverCount; index++) {
+      const downloadEvent = receiverLinks[index].waitForEvent('download', { timeout: 120000 });
+      await receiverLinks[index].locator('#download-file').click();
+      const download = await downloadEvent; await download.saveAs(receiverPaths[index]);
+      firstHashes.push({ receiver: index + 1, sha256: externalSha256(receiverPaths[index]) });
+    }
+    const firstSamples = transferredPayloads.filter(sample => sample.bytes >= firstPhaseStart && sample.bytes <= firstPhaseEnd);
+    const firstElapsedMs = firstSamples.length > 1 ? firstSamples.at(-1).at - firstSamples[0].at : 0;
+    firstPhaseRateMiBPerSecond = firstElapsedMs > 0 ? (firstPhaseEnd - firstPhaseStart) / 1024 ** 2 / (firstElapsedMs / 1000) : null;
   }
-  const firstSamples = transferredPayloads.filter(sample => sample.bytes >= firstPhaseStart && sample.bytes <= firstPhaseEnd);
-  const firstElapsedMs = firstSamples.length > 1 ? firstSamples.at(-1).at - firstSamples[0].at : 0;
-  const firstPhaseRateMiBPerSecond = firstElapsedMs > 0 ? (firstPhaseEnd - firstPhaseStart) / 1024 ** 2 / (firstElapsedMs / 1000) : null;
 
-  if (isolationOnly) {
+  if (isolationOnly && !closeOnly) {
     sampling = false; await monitor;
     const report = { result: firstHashes.every(item => item.sha256 === generated.sha256) ? 'PASS' : 'FAIL_HASH', fileBytes: size, expectedSha256: generated.sha256, receivers: receiverCount, uploadLimitKiBPerSecond: uploadLimitKiB || 'unlimited', receiverHashes: firstHashes, aggregatePayloadMiBPerSecond: firstPhaseRateMiBPerSecond, receiverStatuses: await Promise.all(receiverLinks.map(page => page.locator('#status').evaluate(element => ({ status: element.textContent, verifiedBytes: element.dataset.verifiedBytes, requestCount: element.dataset.requestCount, failed: element.dataset.failed })))) };
     if (report.result !== 'PASS') throw new Error(JSON.stringify(report));
@@ -151,11 +155,14 @@ try {
     await waitForPage(page, () => document.querySelector('#status')?.dataset.missingChunks !== undefined, 60000);
   }
   await waitForPage(sender, () => document.querySelectorAll('#peers .receiver-row:not(.disconnected)').length >= 3, 60000);
-  await waitForPage(receiverLinks[0], () => Number(document.querySelector('#status')?.dataset.verifiedBytes || 0) >= 250 * 1024 ** 2, 15 * 60 * 1000);
+  await receiverLinks[0].waitForFunction(target => Number(document.querySelector('#status')?.dataset.verifiedBytes || 0) >= target, Math.floor(size / 2), { timeout: 15 * 60 * 1000, polling: 200 });
   const closedBytes = Number(await receiverLinks[0].locator('#status').getAttribute('data-verified-bytes'));
-  await receiverLinks[0].close();
-  await waitForPage(sender, () => [...document.querySelectorAll('#peers .receiver-row')].some(row => row.classList.contains('disconnected') && row.dataset.activeSends === '0' && row.dataset.reservedBytes === '0'), 30000);
-  const disconnectedRow = await sender.locator('#peers .receiver-row.disconnected').first().evaluate(row => ({ id: row.querySelector('code')?.textContent, activeSends: row.dataset.activeSends, reservedBytes: row.dataset.reservedBytes, activity: row.textContent }));
+  const closedPeerId = await receiverLinks[0].locator('#status').getAttribute('data-peer-id');
+  await sender.waitForFunction(id => { const row = [...document.querySelectorAll('#peers .receiver-row')].find(candidate => candidate.querySelector('code')?.textContent === id); return Number(row?.dataset.activeSends) > 0 && Number(row?.dataset.reservedBytes) > 0; }, closedPeerId, { timeout: 30000, polling: 200 });
+  const countersBeforeClose = await sender.locator('#peers .receiver-row').evaluateAll((rows, id) => { const row = rows.find(candidate => candidate.querySelector('code')?.textContent === id); return { activeSends: row.dataset.activeSends, reservedBytes: row.dataset.reservedBytes }; }, closedPeerId);
+  await receiverContexts[0].close();
+  await sender.waitForFunction(id => { const row = [...document.querySelectorAll('#peers .receiver-row')].find(candidate => candidate.querySelector('code')?.textContent === id); return row?.classList.contains('disconnected') && row.dataset.activeSends === '0' && row.dataset.reservedBytes === '0'; }, closedPeerId, { timeout: 30000, polling: 200 });
+  const disconnectedRow = await sender.locator('#peers .receiver-row').evaluateAll((rows, id) => { const row = rows.find(candidate => candidate.querySelector('code')?.textContent === id); return { id: row.querySelector('code')?.textContent, activeSends: row.dataset.activeSends, reservedBytes: row.dataset.reservedBytes, activity: row.textContent }; }, closedPeerId);
 
   await Promise.all([1, 2].map(index => waitForPage(receiverLinks[index], () => document.querySelector('#status')?.dataset.transferComplete === 'true', 20 * 60 * 1000)));
   const remainingHashes = [];
@@ -171,24 +178,24 @@ try {
   const secondElapsedMs = secondSamples.length > 1 ? secondSamples.at(-1).at - secondSamples[0].at : 0;
   const secondPhaseRateMiBPerSecond = secondElapsedMs > 0 ? (finalPayloadBytes - firstPhaseEnd) / 1024 ** 2 / (secondElapsedMs / 1000) : null;
   const report = {
-    result: 'PASS', fileBytes: size, expectedSha256: generated.sha256, firstRunReceiversFinished: 3,
+    result: 'PASS', fileBytes: size, expectedSha256: closeTest.sha256, firstRunReceiversFinished: closeOnly ? 0 : receiverCount,
     firstRunHashes: firstHashes, firstRunAggregatePayloadMiBPerSecond: firstPhaseRateMiBPerSecond,
     closeRunFileIdChanged: closeFileId !== firstFileId, closeRunExpectedSha256: closeTest.sha256,
     closeRunRemainingReceiverHashes: remainingHashes,
-    closedReceiver: { durableBytesAtClose: closedBytes, row: disconnectedRow, remainingReceiversContinued: true },
+    closedReceiver: { durableBytesAtClose: closedBytes, countersBeforeClose, row: disconnectedRow, remainingReceiversContinued: true },
     uploadLimitInputKiBPerSecond: 10240, intendedCapMiBPerSecond: 10,
     closeRunAggregatePayloadMiBPerSecond: secondPhaseRateMiBPerSecond, senderPayloadBytesQueued: finalPayloadBytes,
     peakCountedSenderBytes: peakCountedBytes, peakChromeWorkingSetMiB: memorySamples.length ? Math.max(...memorySamples) : null,
     measurement: 'Three headed Chrome receiver windows at x=0,630,1260; each uses an independent persistent profile. Sender is headless. Downloaded hashes use Get-FileHash.',
     chrome: await senderBrowser.version(), browserErrors: logs.app,
   };
-  if (firstHashes.some(item => item.sha256 !== generated.sha256) || remainingHashes.some(item => item.sha256 !== closeTest.sha256) || closeTest.sha256 !== generated.sha256) report.result = 'FAIL_HASH';
+  if ((!closeOnly && (firstHashes.some(item => item.sha256 !== generated.sha256) || closeTest.sha256 !== generated.sha256)) || remainingHashes.some(item => item.sha256 !== closeTest.sha256)) report.result = 'FAIL_HASH';
   if (report.result !== 'PASS') throw new Error(JSON.stringify(report));
-  console.log(`S4_ACCEPTANCE ${JSON.stringify(report, null, 2)}`);
+  console.log(`${closeOnly ? 'S4_CLOSE_ISOLATION' : 'S4_ACCEPTANCE'} ${JSON.stringify(report, null, 2)}`);
   }
 } catch (error) {
   console.error(`S4_ACCEPTANCE_BLOCKED_OR_FAILED ${error.stack || error}`);
-  for (const page of pages) console.error(`PAGE ${page.url()} ${JSON.stringify(await page.evaluate(() => ({ status: document.querySelector('#status')?.textContent, data: { ...document.querySelector('#status')?.dataset }, progress: document.querySelector('#transfer-progress')?.textContent })).catch(() => '(unavailable)'))}`);
+  for (const page of pages) console.error(`PAGE ${page.url()} ${JSON.stringify(await page.evaluate(() => ({ status: document.querySelector('#status')?.textContent, data: { ...document.querySelector('#status')?.dataset }, progress: document.querySelector('#transfer-progress')?.textContent, peers: [...document.querySelectorAll('#peers .receiver-row')].map(row => ({ id: row.querySelector('code')?.textContent, disconnected: row.classList.contains('disconnected'), activeSends: row.dataset.activeSends, reservedBytes: row.dataset.reservedBytes, activity: row.textContent })) })).catch(() => '(unavailable)'))}`);
   if (logs.signal.length) console.error(`PEERSERVER_LOG\n${logs.signal.join('')}`);
   if (logs.app.length) console.error(`APP_LOG\n${logs.app.join('')}`);
   process.exitCode = 1;
