@@ -200,15 +200,15 @@ async function clearFile({ requestId }) {
   bitmap = new Uint8Array(Math.ceil(chunkCount / 8)); self.postMessage({ type: 'CLEAR_OK', requestId });
 }
 
-async function offsetProbe({ requestId }) {
+async function offsetProbe({ requestId, targetSize = 5_000_000_000, offset = 4_500_000_000 }) {
   if (!root || !phase2Complete) throw new Error('Storage probe is unavailable.');
   const name = `offset-probe-${crypto.getRandomValues(new Uint8Array(8)).reduce((s, b) => s + b.toString(16).padStart(2, '0'), '')}`;
-  let handle;
+  let handle, sizeAfterTruncate = null;
   try {
     const file = await root.getFileHandle(name, { create: true }); handle = await file.createSyncAccessHandle();
-    const targetSize = 5_000_000_000, offset = 4_500_000_000, expected = new Uint8Array([13, 29, 47, 83, 131, 197, 211, 251]);
+    const expected = new Uint8Array([13, 29, 47, 83, 131, 197, 211, 251]);
     handle.truncate(targetSize);
-    const sizeAfterTruncate = handle.getSize();
+    sizeAfterTruncate = handle.getSize();
     writeFully(handle, expected, offset, { operation: 'offset-probe', targetSize, sizeAfterTruncate }); handle.flush();
     const actual = readFully(handle, expected.byteLength, offset); const ok = actual.join(',') === expected.join(',') && handle.getSize() === targetSize;
     handle.close(); handle = undefined; await root.removeEntry(name);
@@ -216,7 +216,7 @@ async function offsetProbe({ requestId }) {
   } catch (error) {
     try { handle?.close(); } catch { /* best effort */ }
     try { await root.removeEntry(name); } catch { /* best effort */ }
-    self.postMessage({ type: 'OFFSET_PROBE_RESULT', requestId, ok: false, error: messageOf(error) });
+    self.postMessage({ type: 'OFFSET_PROBE_RESULT', requestId, ok: false, targetSize, offset, sizeAfterTruncate, diagnostics: error?.diagnostics || null, error: messageOf(error) });
   }
 }
 
@@ -231,7 +231,8 @@ function writeFully(handle, bytes, offset, context = {}) {
       const entry = { at: Date.now(), level: 'error', message: 'OPFS returned an invalid partial write length', count, offset: writeOffset, remaining, written, requestedBytes: bytes.byteLength, handleSize, ...context };
       debugLogRing.add(entry);
       self.postMessage({ type: 'DEBUG_LOG', entry });
-      const error = new Error(`OPFS returned invalid write count ${String(count)} at offset ${writeOffset}; remaining ${remaining}; file size ${String(handleSize)}.`);
+      const error = new Error(`OPFS returned invalid write count ${String(count)} at offset ${writeOffset}; remaining ${remaining}; file size ${String(handleSize)}; after truncate ${String(context.sizeAfterTruncate ?? 'unknown')}.`);
+      error.diagnostics = entry;
       error.name = 'InvalidPartialWriteLength'; throw error;
     }
     written += count;
