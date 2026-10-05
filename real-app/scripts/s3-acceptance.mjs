@@ -187,7 +187,7 @@ try {
   const memoryValues = memorySamples.map(sample => sample.workingSetMiB);
   const steadyMemoryMiB = median(memoryValues.slice(-5));
   const report = {
-    result: diskFull.result.startsWith('BLOCKED') ? 'PASS_WITH_TOOLING_BLOCK' : 'PASS', sizeBytes: generated.size, chunkCount: Math.ceil(size / 65536), chunkSizeBytes: 65536,
+    result: offsetProbe?.ok === false ? 'PASS_TRANSFER_WITH_OFFSET_FAIL_AND_TOOLING_BLOCK' : diskFull.result.startsWith('BLOCKED') ? 'PASS_WITH_TOOLING_BLOCK' : 'PASS', sizeBytes: generated.size, chunkCount: Math.ceil(size / 65536), chunkSizeBytes: 65536,
     senderFileId, expectedSha256: generated.sha256, downloadedExternalSha256: externalHash,
     hashMatches: externalHash === generated.sha256, senderHashingMs: Math.round(hashingMs),
     totalMsFirstRequestToLastDurableChunk: totalElapsedMs, transferThroughputMiBPerSecond: Number((size / 1024 ** 2 / (totalElapsedMs / 1000)).toFixed(2)),
