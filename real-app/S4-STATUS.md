@@ -1,0 +1,1 @@
+Cycle 1 — Extracted storage preflight with injected estimate/persist APIs; Clear reacquires the file lock after preflight returns; added bounded OPFS debug ring and partial-write diagnostics. `npm test`: PASS, 28/28. Blocker: none.

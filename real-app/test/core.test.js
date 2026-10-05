@@ -16,6 +16,9 @@ import { ByteBudget } from '../src/lib/byte-budget.js';
 import { encodeProgressRecord, decodeProgressRecord, selectProgressRecord, missingChunkIndices, progressRecordSize } from '../src/lib/progress-record.js';
 import { ByteQueueBudget, OPFS_WRITE_QUEUE_LIMIT } from '../src/lib/byte-queue.js';
 import { fileEntryNames } from '../src/lib/storage-names.js';
+import { checkAvailableStorage } from '../src/lib/storage-preflight.js';
+import { clearWithFileLock } from '../src/lib/receiver-lock.js';
+import { createDebugLogRing } from '../src/lib/debug-log.js';
 
 test('manifest encodes, parses, and hashes canonical bytes including size above 2^32', async () => {
   const h = new Uint8Array(32).fill(7), size = 4294967296 + 5, chunkSize = 4294967295;
@@ -340,4 +343,39 @@ test('source forbids bitwise operators except in the bitfield module', async () 
   for (const { path, source } of sources) if (!relative(fileURLToPath(new URL('../src/', import.meta.url)), path).replaceAll('\\', '/').endsWith('lib/bitfield.js')) {
     assert.equal(forbidden.test(stripNonCode(source)), false, `forbidden bitwise operator in ${path}`);
   }
+});
+
+test('production storage preflight rejects 64 MiB for 500 MiB and accepts 2 GiB', async () => {
+  const mib = 1024 ** 2, calls = { estimate: 0, persist: 0 };
+  const check = available => checkAvailableStorage(500 * mib, {
+    estimate: async () => { calls.estimate++; return { quota: available, usage: 0 }; },
+    persist: async () => { calls.persist++; return true; }, formatBytes: String,
+  });
+  const low = await check(64 * mib);
+  assert.equal(low.ok, false); assert.equal(low.available, 64 * mib); assert.match(low.message, /Insufficient origin storage/);
+  const enough = await check(2 * 1024 * mib);
+  assert.equal(enough.ok, true); assert.equal(enough.available, 2 * 1024 * mib);
+  assert.deepEqual(calls, { estimate: 2, persist: 2 });
+});
+
+test('storage preflight estimate rejection proceeds with an explicit warning', async () => {
+  const result = await checkAvailableStorage(500 * 1024 ** 2, {
+    estimate: async () => { throw new Error('estimate blocked'); }, persist: async () => true, formatBytes: String,
+  });
+  assert.equal(result.ok, true); assert.equal(result.available, null); assert.match(result.warning, /estimate blocked/);
+});
+
+test('Clear reacquires a released receiver lock and never clears without one', async () => {
+  let held = false, clears = 0;
+  const clear = async () => { assert.equal(held, true); clears++; };
+  const requestLock = async callback => { held = true; try { await callback({}); } finally { held = false; } };
+  assert.equal(await clearWithFileLock({ lockHeld: false, requestLock, clear }), true);
+  assert.equal(clears, 1);
+  assert.equal(await clearWithFileLock({ lockHeld: false, requestLock: callback => callback(null), clear }), false);
+  assert.equal(clears, 1);
+});
+
+test('debug log ring retains only the newest entries', () => {
+  const ring = createDebugLogRing(2); ring.add(1); ring.add(2); ring.add(3);
+  assert.deepEqual(ring.list(), [2, 3]);
 });

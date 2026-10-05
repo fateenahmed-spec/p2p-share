@@ -8,6 +8,9 @@ import { decodeFrame, FrameReassembler } from '../lib/frames.js';
 import { encodeBitfield, decodeBitfield, HolderSet } from '../lib/bitfield.js';
 import { RequestScheduler } from '../lib/request-scheduler.js';
 import { OPFS_WRITE_QUEUE_LIMIT } from '../lib/byte-queue.js';
+import { checkAvailableStorage } from '../lib/storage-preflight.js';
+import { clearWithFileLock } from '../lib/receiver-lock.js';
+import { createDebugLogRing } from '../lib/debug-log.js';
 
 const status = document.querySelector('#status');
 const rtt = document.querySelector('#rtt');
@@ -29,6 +32,7 @@ let chunkStates = [], drawPending = false, redFade = false, frameViolations = 0,
 let queueReservedBytes = 0, queueBytes = 0, maxInFlight = 8, requestCount = 0, hashStartedAt = 0, hashElapsedMs = 0;
 let verifyStartedAt = 0, activeVerifyId, workerWaiters = new Map(), pendingWrites = new Map(), rateSamples = [];
 let storageNote = '';
+const debugLogRing = createDebugLogRing(500);
 const OPFS_KEY = 'p2p-recv:';
 
 function send(message) { if (control?.open) control.send(encodeControlMessage(message)); }
@@ -216,6 +220,10 @@ function onStorageMessage(event) {
   if (message.type === 'CLEAR_OK') { clearButton.disabled = false; clearButton.textContent = 'Clear saved data'; status.textContent = 'Saved data cleared.'; downloadButton.disabled = true; verifyButton.disabled = true; }
   if (message.type === 'CLEAR_ERROR' || message.type === 'DOWNLOAD_ERROR') status.textContent = safeError(message.message || message.type);
   if (message.type === 'OFFSET_PROBE_RESULT') status.dataset.offsetProbe = JSON.stringify(message);
+  if (message.type === 'DEBUG_LOG') {
+    debugLogRing.add(message.entry);
+    if (new URL(location.href).searchParams.get('debug') === '1') console.debug('OPFS debug', message.entry);
+  }
 }
 function onChunkDurable(message) {
   queueBytes = message.queueBytes; releaseRequest(message.index);
@@ -317,33 +325,28 @@ async function initializeStorageAfterManifest(parsed) {
       onFileOpened(opened);
       await new Promise(() => {});
     } catch (error) { fail(safeError(error)); }
-  }).catch(error => fail(safeError(error)));
+    finally { fileLockHeld = false; }
+  }).catch(error => { fileLockHeld = false; fail(safeError(error)); });
 }
 
 async function checkAvailableStorage(size) {
-  const required = Math.ceil(size * 1.10 + 128 * 1024 ** 2);
-  storageNote = `Download needs roughly another ${formatBytes(size)} of free disk outside origin quota.`;
-  try {
-    const persistResult = await navigator.storage.persist();
-    if (!persistResult) storageNote = `Browser did not grant persistent-storage status; saved data may be evicted under storage pressure. ${storageNote}`;
-  } catch (error) { storageNote = `Could not request persistent storage: ${safeError(error)}. ${storageNote}`; }
-  try {
-    if (typeof navigator.storage.estimate !== 'function') throw new Error('Storage estimate API unavailable');
-    const { quota, usage } = await navigator.storage.estimate();
-    if (!Number.isFinite(quota) || !Number.isFinite(usage)) throw new Error('Storage estimate did not return quota and usage');
-    const available = Math.max(0, quota - usage);
-    status.dataset.quota = String(quota); status.dataset.usage = String(usage); status.dataset.required = String(required); status.dataset.available = String(available);
-    storageNote = `Origin storage available ${formatBytes(available)}; this transfer requires ${formatBytes(required)}. ${storageNote}`;
-    transferStats.textContent = storageNote;
-    if (available < required) {
-      fail(`Insufficient origin storage: ${formatBytes(required)} required; ${formatBytes(available)} available. Existing saved data is retained. Clear saved data to free this file's storage.`);
-      return false;
-    }
-  } catch (error) {
-    if (new URL(location.href).searchParams.get('debug') === '1') console.debug('Could not estimate origin storage; proceeding', safeError(error));
-    storageNote = `Could not verify available storage; transfer may fail if the disk fills. ${storageNote}`;
-    transferStats.textContent = storageNote;
+  const result = await checkAvailableStorage(size, {
+    estimate: () => {
+      if (typeof navigator.storage.estimate !== 'function') throw new Error('Storage estimate API unavailable');
+      return navigator.storage.estimate();
+    },
+    persist: () => navigator.storage.persist(), formatBytes,
+  });
+  if (result.quota !== null) {
+    status.dataset.quota = String(result.quota); status.dataset.usage = String(result.usage);
+    status.dataset.required = String(result.required); status.dataset.available = String(result.available);
+    storageNote = `Origin storage available ${formatBytes(result.available)}; this transfer requires ${formatBytes(result.required)}. ${result.warning} Download needs roughly another ${formatBytes(size)} of free disk outside origin quota.`;
+  } else {
+    storageNote = `${result.warning} Download needs roughly another ${formatBytes(size)} of free disk outside origin quota.`;
+    if (new URL(location.href).searchParams.get('debug') === '1') console.debug('Storage preflight estimate unavailable; proceeding', result.warning);
   }
+  transferStats.textContent = storageNote;
+  if (!result.ok) { fail(result.message); return false; }
   return true;
 }
 
@@ -421,10 +424,17 @@ async function runOffsetProbe() {
   } catch (error) { document.querySelector('#verify-status').textContent = `OPFS offset probe failed: ${safeError(error)}`; }
   finally { offsetProbeButton.disabled = false; }
 }
-function clearSavedData() {
-  if (!fileLockHeld || !confirm('Delete this file and its resume progress from this browser?')) return;
+async function clearSavedData() {
+  if (!confirm('Delete this file and its resume progress from this browser?')) return;
   clearButton.disabled = true; clearButton.textContent = 'Clearing…';
-  storageWorker.postMessage({ type: 'CLEAR', requestId: cryptoRandomHex() });
+  try {
+    const cleared = await clearWithFileLock({
+      lockHeld: fileLockHeld,
+      requestLock: callback => navigator.locks.request(`${OPFS_KEY}${link.fid}`, { ifAvailable: true }, callback),
+      clear: () => workerCall({ type: 'CLEAR' }, [], 30000),
+    });
+    if (!cleared) { clearButton.disabled = false; clearButton.textContent = 'Clear saved data'; status.textContent = 'Could not acquire the file lock; saved data was not cleared.'; }
+  } catch (error) { clearButton.disabled = false; clearButton.textContent = 'Clear saved data'; status.textContent = safeError(error); }
 }
 
 function formatBytes(value) {
@@ -440,6 +450,7 @@ function createCryptoRandom() {
 const cryptoRandom = createCryptoRandom();
 
 downloadButton.addEventListener('click', downloadFile); saveAsButton.addEventListener('click', saveAsFile); offsetProbeButton.addEventListener('click', runOffsetProbe);
+clearButton.addEventListener('click', clearSavedData);
 verifyButton.addEventListener('click', startVerify); cancelVerifyButton.addEventListener('click', cancelVerify); clearButton.addEventListener('click', clearSavedData);
 try {
   const url = new URL(location.href);

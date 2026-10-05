@@ -1,8 +1,10 @@
 import { encodeProgressRecord, decodeProgressRecord, selectProgressRecord, progressRecordSize } from '../lib/progress-record.js';
 import { fileEntryNames } from '../lib/storage-names.js';
 import { ByteQueueBudget } from '../lib/byte-queue.js';
+import { createDebugLogRing } from '../lib/debug-log.js';
 
 const writeBudget = new ByteQueueBudget();
+const debugLogRing = createDebugLogRing(500);
 let root, phase2Complete = false, preparedId, names, dataFileHandle, progressFileHandle;
 let dataHandle, progressHandle, fileSize, chunkSize, chunkCount, hashes, bitmap;
 let activeSlot = 0, generation = 0, recordSize = 0, fileReady = false;
@@ -41,7 +43,7 @@ async function phase2({ token, requestId }) {
     const fileHandle = await root.getFileHandle(name, { create: true });
     handle = await fileHandle.createSyncAccessHandle();
     const input = new Uint8Array([19, 47, 83, 131]);
-    writeFully(handle, input, 0); handle.flush();
+    writeFully(handle, input, 0, { operation: 'phase2-probe' }); handle.flush();
     const output = readFully(handle, 4, 0);
     handle.close(); handle = undefined;
     await root.removeEntry(name);
@@ -95,7 +97,7 @@ async function openFile(message) {
   } else {
     bitmap = new Uint8Array(Math.ceil(chunkCount / 8)); generation = 0; activeSlot = 0;
     const initial = await encodeProgressRecord({ generation, chunkCount, bitmap });
-    writeFully(progressHandle, initial, 0); progressHandle.flush();
+    writeFully(progressHandle, initial, 0, { operation: 'initial-progress-record' }); progressHandle.flush();
   }
   let changed = false;
   for (let index = 0; index < chunkCount; index++) if (hasBit(index)) {
@@ -132,7 +134,7 @@ async function processQueue() {
       try {
         const bytes = new Uint8Array(item.buffer);
         if (await hashHex(bytes) !== hashes[item.index]) throw new Error(`Verified chunk ${item.index} changed before durable write.`);
-        writeFully(dataHandle, bytes, chunkOffset(item.index)); dataHandle.flush();
+        writeFully(dataHandle, bytes, chunkOffset(item.index), { operation: 'chunk', chunkIndex: item.index }); dataHandle.flush();
         setBit(item.index); await saveProgress();
         writeBudget.release(item.key);
         self.postMessage({ type: 'CHUNK_DURABLE', index: item.index, attempt: item.attempt, queueBytes: writeBudget.bytes, availableBytes: writeBudget.available });
@@ -151,7 +153,7 @@ async function saveProgress() {
   if (generation > 0xffffffff) throw new RangeError('Progress generation exhausted.');
   const targetSlot = 1 - activeSlot;
   const record = await encodeProgressRecord({ generation, chunkCount, bitmap });
-  writeFully(progressHandle, record, targetSlot * recordSize); progressHandle.flush();
+  writeFully(progressHandle, record, targetSlot * recordSize, { operation: 'progress-record', generation, slot: targetSlot }); progressHandle.flush();
   activeSlot = targetSlot;
 }
 
@@ -205,10 +207,12 @@ async function offsetProbe({ requestId }) {
   try {
     const file = await root.getFileHandle(name, { create: true }); handle = await file.createSyncAccessHandle();
     const targetSize = 5_000_000_000, offset = 4_500_000_000, expected = new Uint8Array([13, 29, 47, 83, 131, 197, 211, 251]);
-    handle.truncate(targetSize); writeFully(handle, expected, offset); handle.flush();
+    handle.truncate(targetSize);
+    const sizeAfterTruncate = handle.getSize();
+    writeFully(handle, expected, offset, { operation: 'offset-probe', targetSize, sizeAfterTruncate }); handle.flush();
     const actual = readFully(handle, expected.byteLength, offset); const ok = actual.join(',') === expected.join(',') && handle.getSize() === targetSize;
     handle.close(); handle = undefined; await root.removeEntry(name);
-    self.postMessage({ type: 'OFFSET_PROBE_RESULT', requestId, ok, targetSize, offset });
+    self.postMessage({ type: 'OFFSET_PROBE_RESULT', requestId, ok, targetSize, offset, sizeAfterTruncate });
   } catch (error) {
     try { handle?.close(); } catch { /* best effort */ }
     try { await root.removeEntry(name); } catch { /* best effort */ }
@@ -216,11 +220,20 @@ async function offsetProbe({ requestId }) {
   }
 }
 
-function writeFully(handle, bytes, offset) {
+function writeFully(handle, bytes, offset, context = {}) {
   let written = 0;
   while (written < bytes.byteLength) {
-    const count = handle.write(bytes.subarray(written), { at: offset + written });
-    if (!Number.isSafeInteger(count) || count <= 0 || count > bytes.byteLength - written) throw new Error('OPFS returned an invalid partial write length.');
+    const writeOffset = offset + written, remaining = bytes.byteLength - written;
+    const count = handle.write(bytes.subarray(written), { at: writeOffset });
+    if (!Number.isSafeInteger(count) || count <= 0 || count > remaining) {
+      let handleSize = null;
+      try { handleSize = handle.getSize(); } catch { /* retain the original write failure */ }
+      const entry = { at: Date.now(), level: 'error', message: 'OPFS returned an invalid partial write length', count, offset: writeOffset, remaining, written, requestedBytes: bytes.byteLength, handleSize, ...context };
+      debugLogRing.add(entry);
+      self.postMessage({ type: 'DEBUG_LOG', entry });
+      const error = new Error(`OPFS returned invalid write count ${String(count)} at offset ${writeOffset}; remaining ${remaining}; file size ${String(handleSize)}.`);
+      error.name = 'InvalidPartialWriteLength'; throw error;
+    }
     written += count;
   }
 }
