@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; worker-src 'self'; connect-src 'self' https://0.peerjs.com wss://0.peerjs.com http://localhost:9000 ws://localhost:9000 http://localhost:9001 ws://localhost:9001">
+  <title>P2P Share — Receiver</title>
+  <script type="importmap">{"imports":{"peerjs-js-binarypack":"./vendor/peerjs/deps/binarypack/binarypack.mjs","webrtc-adapter":"./vendor/peerjs/deps/adapter.mjs","@msgpack/msgpack":"./vendor/peerjs/deps/msgpack/index.mjs"}}</script>
+</head>
+<body>
+  <main><h1>Receive a file</h1><p id="feature-status" role="status"></p><p id="status" role="status">Checking link…</p><p>Room: <code id="room"></code></p>
+    <dl><dt>Name</dt><dd id="file-name"></dd><dt>Size</dt><dd id="file-size"></dd></dl><p>Control RTT: <output id="rtt">—</output></p>
+    <details><summary>ICE settings</summary><form id="ice-settings"><label>ICE URLs, one per line <textarea id="ice-urls" autocomplete="off"></textarea></label><label>Username <input id="ice-username" autocomplete="off"></label><label>Credential <input id="ice-credential" type="password" autocomplete="new-password"></label><label><input id="force-relay" type="checkbox"> Force relay</label><button>Apply &amp; reconnect</button><button type="button" id="clear-settings">Clear</button></form></details>
+  </main><script type="module" src="./src/app/receiver.js"></script>
+</body></html>

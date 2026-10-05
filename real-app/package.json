@@ -4,12 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test"
+    "dev": "node scripts/dev-server.mjs",
+    "signal": "node scripts/local-signaling.mjs",
+    "test": "node --test --test-isolation=none"
   },
   "dependencies": {
     "peerjs": "1.5.5"
   },
   "devDependencies": {
+    "peer": "1.0.2",
     "playwright": "1.63.0"
   }
 }
