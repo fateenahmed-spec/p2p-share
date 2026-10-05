@@ -1,6 +1,6 @@
-# P2P Share — Sub-step 1
+# P2P Share — Sub-step 3
 
-Sub-step 1 implements sender identity and signaling, browser feature checks, strict share-link/control-message validation, worker-based file hashing, manifest exchange, paired control and bulk channels, and control-channel PING/PONG diagnostics. Bulk file transfer and receiver persistence are later sub-steps.
+Sub-step 3 adds durable OPFS chunk storage, crash-safe resume metadata, saved-file download and verification, and clear-data controls to the S2 chunked P2P transfer.
 
 ## Requirements and support
 
@@ -25,7 +25,7 @@ To use local signaling, copy `config.example.json` to ignored `config.local.json
 npm run signal
 ```
 
-Open `http://localhost:9000/sender.html`. Choose a non-empty file. The sender hashes one chunk at a time in a worker; it reveals the link only after the canonical manifest and `fileId` are ready. Open the link in a second tab. S1 reports the verified file name/size, exchanged manifest, paired control and bulk channels, receiver BITFIELD, and control RTT. No file bytes are transferred in S1.
+Open `http://localhost:9000/sender.html`. Choose a non-empty file. The sender hashes one chunk at a time in a worker; it reveals the link only after the canonical manifest and `fileId` are ready. Open the link in a second tab. The receiver verifies and stores chunks in OPFS and resumes missing chunks on reload.
 
 Generate the deterministic 5 MiB acceptance file and its streaming SHA-256 with:
 
@@ -41,6 +41,8 @@ npm run acceptance:s1
 
 It starts the local app and signaling servers on temporary ports, uses the installed Chrome channel, creates a 5 MiB test file, prints the acceptance result, and removes its `scratch/` file afterward. It serves a temporary local signaling override in memory and does not overwrite `config.local.json`.
 
+S3 acceptance is run with `npm run acceptance:s3`. It uses local signaling and a generated 500 MiB source file; it exercises durable resume, completed-file reopen, download hash comparison, quota rejection, and (when the reported origin quota is large enough) an OPFS offset probe past 4 GiB.
+
 ## Identity, link, and file ID
 
 The sender persists a 128-bit lowercase hexadecimal PeerJS ID in local storage and holds the exclusive Web Lock `p2p-send:<id>` before creating its Peer. Refreshing retains the same ID and link. A share URL contains exactly one `room` (the raw PeerJS sender ID) and one lowercase 64-character `fid`; duplicate, extra, or malformed parameters are rejected.
@@ -53,13 +55,18 @@ The application always supplies explicit WebRTC configuration: Google STUN only 
 
 PeerJS 1.5.5's default configuration includes public static-credential TURN servers. The explicit app configuration replaces those defaults, so those servers are not used unless the user supplies them.
 
-## Measured S1 acceptance
+## Measured earlier acceptance
 
-One run on 2026-10-05 used headless Chrome 154.0.8037.97 and the local PeerServer. The sender hashed a 5,242,880-byte file; its streaming SHA-256 was `315cf4e39ff22057829a9d8ad75c469968ea6fbb0a51bfd8be38fc4493ebd28c`. The receiver verified `fileId` `69eb881304f76593ed41f9fa6733efc9b7843afdc73499e2d9c80dc8f401b46a`, reconstructed the 2,602-byte manifest from 1 part, displayed `test-5mb.bin` / `5242880 bytes`, paired both channels, and exchanged a 10-byte BITFIELD. Measured control RTT was 4 ms. This run did not transfer the 5 MiB file payload or measure transfer throughput.
+S1 on 2026-10-05 used headless Chrome 154.0.8037.97 and local PeerServer. The sender hashed 5,242,880 bytes; the receiver verified the manifest, displayed the expected name/size, paired both channels, and exchanged BITFIELD. Measured control RTT was 4 ms; S1 did not transfer payload bytes.
 
-## Known S1 limits
+S2 transferred 33,554,432 bytes in 23,786 ms after the first REQUEST, at 1.35 MiB/s, with 8/8 in-flight requests, using Chrome 154.0.8037.97 and a same-host local PeerServer. Receiver SHA-256 matched the Node streaming hash. Measured control RTT was 360 ms. A direct-PONG trial measured 325 ms RTT but 1.30 MiB/s, so it was reverted. The high localhost RTT remains a measurement quirk to revisit after S4; one hypothesis is PONG delay from bulk processing on the receiver main thread.
 
-- File bytes, chunk framing, retry/resume, quota checks, and durable OPFS transfer storage are not implemented yet.
-- Sender PING/PONG RTT is diagnostic only; S1 does not yet implement D14 dead-peer recovery.
+## Saved-file download trade-offs
+
+The default Download action gets an OPFS `File`, creates an object URL, and clicks a temporary anchor. This is simple and avoids copying file bytes through JavaScript, but very large object-URL behavior varies by browser and may require additional disk space. Where `showSaveFilePicker` is available, Save As streams the OPFS file to a user-selected writable file and displays progress; the browser prompts for a destination and the copy still needs roughly another file size of free disk. Neither download path changes the retained OPFS copy. Use Clear saved data when that copy is no longer needed.
+
+## Current limits
+
+- Sender PING/PONG RTT is diagnostic only; D14 dead-peer recovery is not implemented.
 - Custom signaling hosts must be added to both pages' CSP `connect-src` allow-list.
-- Browser resource usage, multi-gigabyte files, relay behavior, and real-device transfers have not been measured.
+- Physical-LAN performance, multi-gigabyte transfers, relay behavior, Chrome Task Manager steady-state memory, and real-device transfers remain unmeasured.

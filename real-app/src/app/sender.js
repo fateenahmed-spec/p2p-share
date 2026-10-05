@@ -42,7 +42,7 @@ function renderPeers() {
   document.querySelector('#byte-counts').textContent = String(countedBytes());
   peersLabel.textContent = [...sessions.values()].map(s => {
     const active = s.activeSends.size, pending = [...requestStates.values()].filter(r => r.session === s).length;
-    return `${s.peerId}: ${s.bulk?.open ? 'control + bulk paired' : 'waiting for bulk'}; ${active} active sends, ${pending} requested chunks; ${countedBytes()} bytes budgeted`;
+    return `${s.peerId}: ${s.bulk?.open ? 'control + bulk paired' : 'waiting for bulk'}; ${active} active sends, ${pending} requested chunks; ${s.requestCount} REQUESTs served; ${countedBytes()} bytes budgeted`;
   }).join('\n') || 'No receivers connected.';
 }
 function countedBytes() { const m = bufferedMetrics(); return budget.countedBytes(m.global); }
@@ -96,7 +96,7 @@ function acceptControl(control) {
       if (message.type !== 'HELLO' || message.role !== 'receiver' || message.protocolVersion !== 1) {
         control.send(encodeControlMessage({ type: 'ERROR', code: 'PROTOCOL', message: 'Expected receiver HELLO for protocol version 1.' })); control.close(); return;
       }
-      session = { control, peerId: control.peer, sessionId: random.hex128(), bulk: null, manifestSent: false, activeSends: new Map(), ledger: new RequestLedger() };
+      session = { control, peerId: control.peer, sessionId: random.hex128(), bulk: null, manifestSent: false, activeSends: new Map(), ledger: new RequestLedger(), requestCount: 0 };
       sessions.set(control.peer, session);
       send(control, { type: 'HELLO', role: 'sender', protocolVersion: 1, sessionId: session.sessionId });
       const waiting = pendingBulk.get(control.peer);
@@ -119,12 +119,13 @@ function acceptControl(control) {
         const byte = Number.parseInt(message.hex.slice(Math.floor(i / 8) * 2, Math.floor(i / 8) * 2 + 2), 16);
         if (Math.floor(byte / (2 ** (i % 8))) % 2 === 1) session.receiverHave.add(i);
       }
-      peersLabel.textContent = `${session.peerId}: control + bulk paired; BITFIELD ${message.hex.length / 2} bytes; ${verified} chunks verified; ${session.activeSends.size} active; ${countedBytes()} bytes budgeted`;
+      const percent = metadata.chunkCount ? verified * 100 / metadata.chunkCount : 0;
+      peersLabel.textContent = `${session.peerId}: control + bulk paired; BITFIELD ${message.hex.length / 2} bytes; ${verified}/${metadata.chunkCount} chunks verified (${percent.toFixed(1)}%); ${session.activeSends.size} active; ${countedBytes()} bytes budgeted`;
       return;
     }
     if (message.type === 'HAVE') { message.indices.forEach(i => session.receiverHave?.add(i)); return; }
     if (message.type === 'REJECT') { cancelRequest(session, message.index, message.attempt); return; }
-    if (message.type === 'REQUEST') { onRequest(session, message); return; }
+    if (message.type === 'REQUEST') { session.requestCount++; onRequest(session, message); renderPeers(); return; }
     if (message.type === 'CANCEL') { cancelRequest(session, message.index, message.attempt); return; }
     if (message.type === 'HELLO' || message.type === 'PONG') { if (message.type === 'HELLO') control.close(); return; }
     control.close();

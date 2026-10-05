@@ -13,7 +13,9 @@ import { encodeBitfield, decodeBitfield, HolderSet } from '../src/lib/bitfield.j
 import { TokenBucket } from '../src/lib/token-bucket.js';
 import { RequestLedger, RequestScheduler } from '../src/lib/request-scheduler.js';
 import { ByteBudget } from '../src/lib/byte-budget.js';
-import { createMemorySink, MEMORY_SINK_LIMIT } from '../src/test-only/memory-sink.js';
+import { encodeProgressRecord, decodeProgressRecord, selectProgressRecord, missingChunkIndices, progressRecordSize } from '../src/lib/progress-record.js';
+import { ByteQueueBudget, OPFS_WRITE_QUEUE_LIMIT } from '../src/lib/byte-queue.js';
+import { fileEntryNames } from '../src/lib/storage-names.js';
 
 test('manifest encodes, parses, and hashes canonical bytes including size above 2^32', async () => {
   const h = new Uint8Array(32).fill(7), size = 4294967296 + 5, chunkSize = 4294967295;
@@ -232,12 +234,53 @@ test('byte budget keeps ten receivers within global and per-peer caps and releas
   assert.equal(budget.reservedBytes('gone'), 0);
 });
 
-test('memory sink rejects over-limit files before calling its allocator', () => {
-  let allocated = false;
-  assert.throws(() => createMemorySink(MEMORY_SINK_LIMIT + 1, () => { allocated = true; throw new Error('allocated'); }));
-  assert.equal(allocated, false);
-  const sink = createMemorySink(4); sink.write(0, 0, new Uint8Array([1, 2, 3, 4]));
-  assert.deepEqual(sink.view(), new Uint8Array([1, 2, 3, 4]));
+test('progress records round-trip, reject checksum damage, select newest valid generation, and derive missing bits', async () => {
+  const digest = bytes => new Uint8Array(createHash('sha256').update(bytes).digest());
+  const older = await encodeProgressRecord({ generation: 4, chunkCount: 10, bitmap: new Uint8Array([0x03, 0]) }, digest);
+  const newer = await encodeProgressRecord({ generation: 5, chunkCount: 10, bitmap: new Uint8Array([0x13, 0]) }, digest);
+  assert.equal(progressRecordSize(10), 58);
+  assert.deepEqual(await decodeProgressRecord(newer, digest), { version: 1, generation: 5, chunkCount: 10, bitmap: new Uint8Array([0x13, 0]) });
+  const torn = newer.slice(); torn[torn.length - 1] ^= 1;
+  assert.equal(await decodeProgressRecord(torn, digest), null);
+  assert.deepEqual((await selectProgressRecord([older, newer], 10, digest)).record, { version: 1, generation: 5, chunkCount: 10, bitmap: new Uint8Array([0x13, 0]) });
+  assert.equal((await selectProgressRecord([older, torn], 10, digest)).record.generation, 4);
+  assert.equal((await selectProgressRecord([older, newer], 9, digest)).status, 'mismatch');
+  assert.deepEqual(missingChunkIndices(10, new Uint8Array([0x13, 0])), [2, 3, 5, 6, 7, 8, 9]);
+});
+
+test('OPFS write queue accounts up to 16 MiB and releases bytes after acknowledgement', () => {
+  const queue = new ByteQueueBudget();
+  assert.equal(queue.reserve('a', 8 * 1024 ** 2), true);
+  assert.equal(queue.reserve('b', 8 * 1024 ** 2), true);
+  assert.equal(queue.bytes, OPFS_WRITE_QUEUE_LIMIT);
+  assert.equal(queue.reserve('c', 1), false);
+  assert.equal(queue.release('a'), true);
+  assert.equal(queue.available, 8 * 1024 ** 2);
+  assert.equal(queue.reserve('c', 4 * 1024 ** 2), true);
+  assert.equal(queue.bytes, 12 * 1024 ** 2);
+});
+
+test('fileId-derived OPFS filenames are stable and reject unsafe IDs', () => {
+  const fid = 'ab'.repeat(32);
+  assert.deepEqual(fileEntryNames(fid), { data: `data-${fid}.bin`, progress: `progress-${fid}.bin` });
+  assert.deepEqual(fileEntryNames(fid), fileEntryNames(fid));
+  assert.throws(() => fileEntryNames('../' + fid));
+});
+
+test('test-only memory sink is removed and no source module imports it', async () => {
+  const { readdir, access } = await import('node:fs/promises');
+  const { fileURLToPath } = await import('node:url'); const { join } = await import('node:path');
+  const sourceRoot = fileURLToPath(new URL('../src/', import.meta.url));
+  await assert.rejects(access(join(sourceRoot, 'test-only', 'memory-sink.js')));
+  async function visit(dir) {
+    const files = [];
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) files.push(...await visit(path)); else if (/\.js$/.test(entry.name)) files.push(path);
+    }
+    return files;
+  }
+  for (const path of await visit(sourceRoot)) assert.doesNotMatch(await readFile(path, 'utf8'), /memory-sink/);
 });
 
 test('fuzzed frame and control decoders reject arbitrary input without throwing', () => {
@@ -256,13 +299,45 @@ test('fuzzed frame and control decoders reject arbitrary input without throwing'
 test('source forbids bitwise operators except in the bitfield module', async () => {
   const { readdir, readFile } = await import('node:fs/promises'); const { fileURLToPath } = await import('node:url'); const { join, relative } = await import('node:path');
   async function files(dir) { const out = []; for (const ent of await readdir(dir, { withFileTypes: true })) { const path = join(dir, ent.name); if (ent.isDirectory()) out.push(...await files(path)); else if (/\.js$/.test(ent.name)) out.push({ path, source: await readFile(path, 'utf8') }); } return out; }
+  function stripNonCode(source) {
+    let out = '', i = 0, previous = 'start';
+    const regexBefore = new Set(['start', '(', '[', '{', ',', ':', ';', '!', '?', '=', '=>', '&&', '||', 'return', 'case', 'throw', 'yield', 'await']);
+    while (i < source.length) {
+      const c = source[i], n = source[i + 1];
+      if (/\s/.test(c)) { out += ' '; i++; continue; }
+      if (c === '"' || c === "'" || c === '`') {
+        const quote = c; i++;
+        while (i < source.length) { if (source[i] === '\\') { i += 2; continue; } if (source[i++] === quote) break; }
+        out += ' '; previous = 'value'; continue;
+      }
+      if (c === '/' && n === '/') { i += 2; while (i < source.length && source[i] !== '\n') i++; out += ' '; continue; }
+      if (c === '/' && n === '*') { i += 2; while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i++; i = Math.min(source.length, i + 2); out += ' '; continue; }
+      if (c === '/' && regexBefore.has(previous)) {
+        let j = i + 1, escaped = false, inClass = false, closed = false;
+        for (; j < source.length && source[j] !== '\n'; j++) {
+          const ch = source[j];
+          if (escaped) { escaped = false; continue; }
+          if (ch === '\\') { escaped = true; continue; }
+          if (ch === '[') inClass = true; else if (ch === ']') inClass = false;
+          else if (ch === '/' && !inClass) { j++; while (/[a-z]/i.test(source[j] || '')) j++; closed = true; break; }
+        }
+        if (closed) { out += ' '; i = j; previous = 'value'; continue; }
+      }
+      if (/[A-Za-z_$]/.test(c)) {
+        let j = i + 1; while (/[A-Za-z0-9_$]/.test(source[j] || '')) j++;
+        const word = source.slice(i, j); out += word; previous = regexBefore.has(word) ? word : 'value'; i = j; continue;
+      }
+      if (/[0-9]/.test(c)) { let j = i + 1; while (/[A-Za-z0-9_.]/.test(source[j] || '')) j++; out += source.slice(i, j); previous = 'value'; i = j; continue; }
+      const two = source.slice(i, i + 2);
+      out += c;
+      if (['&&', '||', '=>'].includes(two)) { out += n; previous = two; i += 2; }
+      else { previous = c; i++; }
+    }
+    return out;
+  }
   const sources = await files(fileURLToPath(new URL('../src/', import.meta.url)));
   const forbidden = /(?<!&)&(?!&)|(?<!\|)\|(?!\|)|\^|~|<<|>>/;
   for (const { path, source } of sources) if (!relative(fileURLToPath(new URL('../src/', import.meta.url)), path).replaceAll('\\', '/').endsWith('lib/bitfield.js')) {
-    const code = source
-      .replace(/(['"`])(?:\\[\s\S]|(?!\1)[^\\])*?\1/g, ' ')
-      .replace(/\/[^/\\\r\n]*(?:\\.[^/\\\r\n]*)*\/[dgimsuvy]*/g, ' ')
-      .replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, ' ');
-    assert.equal(forbidden.test(code), false, `forbidden bitwise operator in ${path}`);
+    assert.equal(forbidden.test(stripNonCode(source)), false, `forbidden bitwise operator in ${path}`);
   }
 });

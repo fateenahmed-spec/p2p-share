@@ -11,6 +11,15 @@
     <dl><dt>Name</dt><dd id="file-name"></dd><dt>Size</dt><dd id="file-size"></dd></dl><p>Control RTT: <output id="rtt">—</output></p>
     <p id="transfer-progress">Waiting for manifest.</p><p id="transfer-stats"></p>
     <canvas id="chunk-grid" width="900" height="12" role="img" aria-label="Chunk transfer status grid"></canvas>
+    <section id="saved-file-actions" aria-label="Saved file actions">
+      <button id="download-file" type="button" disabled>Download</button>
+      <button id="save-as" type="button" hidden>Save As…</button>
+      <button id="verify-file" type="button" disabled>Verify whole file</button>
+      <button id="cancel-verify" type="button" hidden>Cancel verification</button>
+      <button id="offset-probe" type="button" hidden>Run DEBUG OPFS offset probe</button>
+      <button id="clear-saved-data" type="button" hidden>Clear saved data</button>
+      <p id="verify-status" role="status"></p>
+    </section>
     <details><summary>ICE settings</summary><form id="ice-settings"><label>ICE URLs, one per line <textarea id="ice-urls" autocomplete="off"></textarea></label><label>Username <input id="ice-username" autocomplete="off"></label><label>Credential <input id="ice-credential" type="password" autocomplete="new-password"></label><label><input id="force-relay" type="checkbox"> Force relay</label><button>Apply &amp; reconnect</button><button type="button" id="clear-settings">Clear</button></form></details>
   </main><script type="module" src="./src/app/receiver.js"></script>
 </body></html>

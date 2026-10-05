@@ -1,6 +1,6 @@
 # P2P Share — Sub-step 0 Design
 
-**Status:** Sub-step 0 approved; Sub-step 1 in progress. No Sub-step 2 work is authorized until S1 review.
+**Status:** Sub-steps 0–2 approved; Sub-step 3 in progress. Stop after S3 for review.
 
 This document folds in Parts 1–4 and all follow-up answers. Part 1–3 decisions and approved answers are binding. Remaining implementation-specific choices are recorded as proposals.
 
@@ -368,6 +368,8 @@ Method for final transfer results: total time is first REQUEST to last chunk ver
 | Stage 1 star | Not measured | 3 | Not measured | Not measured | Not measured | Not measured | Not measured | 0 |
 | S0 browser capability probe | 4-byte payload | 2 pages | n/a | local host candidate | Passed headless + headed; duration not retained | Not measured | n/a | 1 each |
 
+S2 acceptance note (one run, not a three-run median): 32 MiB transferred in 23,786 ms after the first REQUEST, 1.35 MiB/s, 8/8 request slots observed, Chrome 154.0.8037.97, same-host local PeerServer, measured control RTT 360 ms. A one-cycle receiver change that sent PONG directly on the control RTCDataChannel measured 325 ms RTT and 1.30 MiB/s; this did not resolve the unexpectedly high RTT and was reverted. Measurement quirk to revisit after S4: hypothesis is that PONG handling is delayed by bulk-frame processing on the receiver main thread.
+
 ## 14. Approved answers and remaining questions
 
-The five Sub-step 0 questions are resolved: real-device verification is post-S4 with no hosting/certs/flags in S1–S4; disk-full retains verified data/progress and releases memory/handles with a Clear saved data action; explicit Peer config defaults to Google STUN only with no TURN and includes `sdpSemantics`; D1/D5 bounds and manifest layout are accepted; timeout formula and cadence are accepted. Sub-step 1 still stops for review before Sub-step 2.
+The five Sub-step 0 questions are resolved: real-device verification is post-S4 with no hosting/certs/flags in S1–S4; disk-full retains verified data/progress and releases memory/handles with a Clear saved data action; explicit Peer config defaults to Google STUN only with no TURN and includes `sdpSemantics`; D1/D5 bounds and manifest layout are accepted; timeout formula and cadence are accepted. S2 is approved; S3 is in progress and stops for review before S4.
