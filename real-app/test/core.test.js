@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { encodeManifest, parseManifest, fileId } from '../src/lib/manifest.js';
 import { chunkSizeFor } from '../src/lib/chunk-size.js';
-import { parseControlMessage, parseShareLink } from '../src/lib/validators.js';
+import { parseControlMessage, parseShareLink, encodeControlMessage } from '../src/lib/validators.js';
 import { makePeerOptions } from '../src/lib/rtc-config.js';
 import { createRandom } from '../src/lib/random.js';
 import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 
 test('manifest encodes, parses, and hashes canonical bytes including size above 2^32', async () => {
   const h = new Uint8Array(32).fill(7), size = 4294967296 + 5, chunkSize = 4294967295;
@@ -27,6 +28,23 @@ test('control and link validators reject malformed or ambiguous input', () => {
   assert.deepEqual(parseShareLink('https://example.test/receiver.html?room=' + 'a'.repeat(32) + '&fid=' + 'b'.repeat(64)).room, 'a'.repeat(32));
   assert.throws(() => parseShareLink('https://x/?room=' + 'a'.repeat(32) + '&room=' + 'a'.repeat(32) + '&fid=' + 'b'.repeat(64)));
 });
+test('control schemas require JSON strings, reject role and field violations, and copy known fields only', () => {
+  assert.throws(() => parseControlMessage({ type: 'PING', seq: 1 }));
+  assert.deepEqual(parseControlMessage('{"type":"HELLO","role":"receiver","protocolVersion":1,"ignored":true}'),
+    { type: 'HELLO', role: 'receiver', protocolVersion: 1 });
+  assert.deepEqual(parseControlMessage(encodeControlMessage({ type: 'HELLO', role: 'sender', protocolVersion: 1, sessionId: 'a'.repeat(32) })),
+    { type: 'HELLO', role: 'sender', protocolVersion: 1, sessionId: 'a'.repeat(32) });
+  for (const value of [
+    '{"type":"HELLO","role":"receiver","protocolVersion":1,"sessionId":"' + 'a'.repeat(32) + '"}',
+    '{"type":"HELLO","role":"sender","protocolVersion":1,"sessionId":"bad"}',
+    '{"type":"PING","seq":-1}', '{"type":"PING","seq":1.5}',
+    '{"type":"MANIFEST_DATA","seq":0,"data":"GG"}', '{"type":"UNKNOWN"}',
+    '{"type":"BITFIELD","hex":"AA"}',
+  ]) assert.throws(() => parseControlMessage(value));
+  assert.throws(() => parseControlMessage('{"type":"PING","seq":1,"note":"' + 'é'.repeat(32764) + '"}'));
+  const have = parseControlMessage('{"type":"HAVE","indices":[1,2],"extra":"discarded"}');
+  assert.deepEqual(have, { type: 'HAVE', indices: [1, 2] });
+});
 test('PeerJS config explicitly replaces defaults; no peerjs.com TURN host unless supplied', () => {
   const options = makePeerOptions();
   assert.equal(options.config.sdpSemantics, 'unified-plan');
@@ -43,6 +61,10 @@ test('CSP covers signaling host in config.example.json on both pages', async () 
     assert.match(html, new RegExp('https://' + host.replaceAll('.', '\\.')));
     assert.match(html, new RegExp('wss://' + host.replaceAll('.', '\\.')));
     assert.match(html, /http:\/\/localhost:9000/);
+    const importMap = html.match(/<script type="importmap">([\s\S]*?)<\/script>/);
+    assert.ok(importMap, `${page} must retain the import map`);
+    const hash = createHash('sha256').update(importMap[1]).digest('base64');
+    assert.ok(html.includes(`'sha256-${hash}'`), `${page} CSP must allow only the exact inline import map`);
   }
 });
 test('random range reduction rejects out-of-range Uint32 values', () => {
