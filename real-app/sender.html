@@ -4,17 +4,18 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-43QWdXRYqoruk3xgeG1fkfclU77XwuXByfeHGbc8oj0='; worker-src 'self'; connect-src 'self' https://0.peerjs.com wss://0.peerjs.com http://localhost:9000 ws://localhost:9000 http://localhost:9001 ws://localhost:9001 http://127.0.0.1:9001 ws://127.0.0.1:9001">
   <link rel="stylesheet" href="./src/app/sender.css">
+  <link rel="stylesheet" href="styles.css">
   <title>P2P Share — Sender</title>
   <script type="importmap">{"imports":{"peerjs-js-binarypack":"./vendor/peerjs/deps/binarypack/binarypack.mjs","webrtc-adapter":"./vendor/peerjs/deps/adapter.mjs","@msgpack/msgpack":"./vendor/peerjs/deps/msgpack/index.mjs"}}</script>
 </head>
 <body>
-  <main><h1>Share a file</h1><p id="feature-status" role="status"></p><p id="status" role="status">Starting…</p>
-    <button id="choose">Choose file</button><input id="file" type="file" hidden>
-    <section id="share-link" hidden><label>Share link <input id="share-url" readonly size="76"></label><p>File ID: <code id="file-id"></code></p></section>
-    <p>Control RTT: <output id="rtt">—</output></p>
-    <section aria-live="polite"><h2>Receivers</h2><div id="peers">No receivers connected.</div></section>
-    <p>Byte accounting: <output id="byte-counts">0</output> bytes reserved or queued; global cap 67108864, per receiver cap 16777216.</p>
-    <label>Global upload cap, KiB/s (0 = unlimited) <input id="upload-limit" type="number" min="0" max="102400" step="1" value="0"></label>
-    <details><summary>ICE settings</summary><form id="ice-settings"><label>ICE URLs, one per line <textarea id="ice-urls" autocomplete="off"></textarea></label><label>Username <input id="ice-username" autocomplete="off"></label><label>Credential <input id="ice-credential" type="password" autocomplete="new-password"></label><label><input id="force-relay" type="checkbox"> Force relay</label><button>Apply &amp; reconnect</button><button type="button" id="clear-settings">Clear</button></form></details>
+  <main class="app-shell sender-app"><h1 class="page-title">Share a file</h1><p id="feature-status" class="feature-status" role="status"></p><p id="status" class="status-line" role="status">Starting…</p>
+    <button id="choose" class="button button-primary">Choose file</button><input id="file" type="file" hidden>
+    <section id="share-link" class="panel share-panel" hidden><label class="share-label">Share link <input id="share-url" class="share-input" readonly size="76"></label><p class="file-id-line">File ID: <code id="file-id"></code></p></section>
+    <p class="metric-line">Control RTT: <output id="rtt" class="metric-value">—</output></p>
+    <section class="panel receiver-panel" aria-live="polite"><h2 class="section-title">Receivers</h2><div id="peers" class="peers-list">No receivers connected.</div></section>
+    <p class="hint-line">Byte accounting: <output id="byte-counts" class="metric-value">0</output> bytes reserved or queued; global cap 67108864, per receiver cap 16777216.</p>
+    <label class="field-label upload-limit-label">Global upload cap, KiB/s (0 = unlimited) <input id="upload-limit" class="text-input" type="number" min="0" max="102400" step="1" value="0"></label>
+    <details class="settings-panel"><summary class="settings-summary">ICE settings</summary><form id="ice-settings" class="settings-form"><label class="field-label">ICE URLs, one per line <textarea id="ice-urls" class="text-area" autocomplete="off"></textarea></label><label class="field-label">Username <input id="ice-username" class="text-input" autocomplete="off"></label><label class="field-label">Credential <input id="ice-credential" class="text-input" type="password" autocomplete="new-password"></label><label class="check-label"><input id="force-relay" type="checkbox"> Force relay</label><button class="button">Apply &amp; reconnect</button><button class="button button-secondary" type="button" id="clear-settings">Clear</button></form></details>
   </main><script type="module" src="./src/app/sender.js"></script>
 </body></html>
